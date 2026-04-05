@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import UTC, datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 import json
@@ -126,20 +127,38 @@ class StandardPipelineService:
             report_markdown=report_markdown,
         )
 
-    def write_outputs(self, artifact_dir: Path, output: PipelineOutput) -> dict[str, Path]:
-        derived_dir = artifact_dir / 'derived'
-        derived_dir.mkdir(parents=True, exist_ok=True)
+    def write_outputs(
+        self,
+        graph_space_dir: Path,
+        output: PipelineOutput,
+        *,
+        artifact_dir: Path | None = None,
+        standard_uid: str | None = None,
+        document_id: str | None = None,
+    ) -> dict[str, Path]:
+        graph_space_dir.mkdir(parents=True, exist_ok=True)
         files = {
-            'normalized_blocks': derived_dir / 'normalized_blocks.json',
-            'normalized_structure': derived_dir / 'normalized_structure.json',
-            'clauses': derived_dir / 'clauses.json',
-            'requirements': derived_dir / 'requirements.json',
-            'graph_nodes': derived_dir / 'graph_nodes.json',
-            'graph_edges': derived_dir / 'graph_edges.json',
-            'embedding_inputs': derived_dir / 'embedding_inputs.jsonl',
-            'metrics': derived_dir / 'segmentation_metrics.json',
-            'report': derived_dir / 'segmentation_report.md',
+            'manifest': graph_space_dir / 'space_manifest.json',
+            'normalized_blocks': graph_space_dir / 'normalized_blocks.json',
+            'normalized_structure': graph_space_dir / 'normalized_structure.json',
+            'clauses': graph_space_dir / 'clauses.json',
+            'requirements': graph_space_dir / 'requirements.json',
+            'graph_nodes': graph_space_dir / 'graph_nodes.json',
+            'graph_edges': graph_space_dir / 'graph_edges.json',
+            'embedding_inputs': graph_space_dir / 'embedding_inputs.jsonl',
+            'embedding_store': graph_space_dir / 'embedding_store.jsonl',
+            'metrics': graph_space_dir / 'segmentation_metrics.json',
+            'report': graph_space_dir / 'segmentation_report.md',
         }
+        manifest = {
+            'space_type': 'standard_graph',
+            'standard_id': standard_uid,
+            'document_id': document_id,
+            'artifact_dir': str(artifact_dir) if artifact_dir else None,
+            'graph_space_dir': str(graph_space_dir),
+            'generated_at': datetime.now(UTC).isoformat(),
+        }
+        files['manifest'].write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         files['normalized_blocks'].write_text(json.dumps(output.normalized_blocks, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         files['normalized_structure'].write_text(json.dumps({'nodes': output.structure_nodes}, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         files['clauses'].write_text(json.dumps(output.clauses, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
@@ -148,9 +167,51 @@ class StandardPipelineService:
         files['graph_edges'].write_text(json.dumps(output.graph_edges, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         lines = [json.dumps(item, ensure_ascii=False) for item in output.embedding_documents]
         files['embedding_inputs'].write_text(('\n'.join(lines) + ('\n' if lines else '')), encoding='utf-8')
+
+        embedding_store_records = self._build_local_embedding_store_records(output.embedding_documents, output.embedding_vectors)
+        if not self.postgres_graph_store.enabled:
+            if embedding_store_records:
+                store_lines = [json.dumps(item, ensure_ascii=False) for item in embedding_store_records]
+                files['embedding_store'].write_text(('\n'.join(store_lines) + '\n'), encoding='utf-8')
+                output.metrics['local_embedding_store_status'] = 'completed'
+                output.metrics['local_embedding_store_record_count'] = len(embedding_store_records)
+            else:
+                output.metrics['local_embedding_store_status'] = 'skipped_no_vectors'
+                files.pop('embedding_store')
+        else:
+            output.metrics['local_embedding_store_status'] = 'skipped_postgres_enabled'
+            files.pop('embedding_store')
+
         files['metrics'].write_text(json.dumps(output.metrics, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         files['report'].write_text(output.report_markdown, encoding='utf-8')
         return files
+
+    def _build_local_embedding_store_records(
+        self,
+        embedding_documents: list[dict[str, Any]],
+        embedding_vectors: dict[str, list[float]],
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for item in embedding_documents:
+            node_uid = item.get('node_uid')
+            if not node_uid:
+                continue
+            vector = embedding_vectors.get(node_uid)
+            if vector is None:
+                continue
+            records.append(
+                {
+                    'node_uid': node_uid,
+                    'standard_uid': item.get('standard_uid'),
+                    'node_type': item.get('node_type'),
+                    'text': item.get('text'),
+                    'embedding_model': self.config.embedding.model,
+                    'embedding_dimensions': len(vector),
+                    'embedding': vector,
+                }
+            )
+        return records
+
     def _flatten_content_list(self, pages: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
         blocks: list[dict[str, Any]] = []
         for page_idx, page in enumerate(pages, start=1):

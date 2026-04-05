@@ -15,7 +15,7 @@ from repositories.standard_registry import StandardRegistry
 from services.standard_pipeline import StandardPipelineService
 
 
-def _sync_registry(config, standard_id: str, artifact_dir: Path) -> None:
+def _sync_registry(config, standard_id: str, artifact_dir: Path, graph_space_dir: Path) -> None:
     registry = StandardRegistry(config.registry_path)
     existing = registry.get(standard_id)
     year = standard_id.split(':')[-1] if ':' in standard_id else None
@@ -27,9 +27,9 @@ def _sync_registry(config, standard_id: str, artifact_dir: Path) -> None:
         title=existing.title if existing else standard_id,
         aliases=existing.aliases if existing else [],
         effectiveDate=existing.effectiveDate if existing else None,
-        documentId=existing.documentId if existing else artifact_dir.name,
+        documentId=artifact_dir.name,
         artifactDir=str(artifact_dir),
-        derivedDir=str(artifact_dir / 'derived'),
+        graphSpaceDir=str(graph_space_dir),
         graphStatus='ready',
         latestJobId=existing.latestJobId if existing else None,
     )
@@ -38,8 +38,9 @@ def _sync_registry(config, standard_id: str, artifact_dir: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Run structure normalization, clause segmentation, and LLM/heuristic KG extraction for a MinerU artifact directory.')
-    parser.add_argument('--artifact-dir', required=True, help='Path to the artifact directory containing content_list_v2.json')
+    parser.add_argument('--artifact-dir', required=True, help='Path to the parse artifact directory containing content_list_v2.json')
     parser.add_argument('--standard-id', required=True, help='Standard UID, for example sl258:2017')
+    parser.add_argument('--graph-space-dir', help='Optional output graph space directory. Defaults to data/kg_spaces/<standard_id>.')
     parser.add_argument('--disable-llm', action='store_true', help='Force heuristic extraction for this run only.')
     parser.add_argument('--llm-timeout-seconds', type=int, help='Override LLM response timeout for this run only.')
     args = parser.parse_args()
@@ -55,12 +56,26 @@ def main() -> None:
     if args.llm_timeout_seconds is not None:
         config.llm.timeout_seconds = args.llm_timeout_seconds
 
+    if args.graph_space_dir:
+        graph_space_dir = Path(args.graph_space_dir)
+        if not graph_space_dir.is_absolute():
+            graph_space_dir = (PROJECT_ROOT / graph_space_dir).resolve()
+    else:
+        graph_space_dir = config.kg_space_dir_for(args.standard_id)
+
     service = StandardPipelineService(config=config)
     output = service.run(artifact_dir, args.standard_id)
-    files = service.write_outputs(artifact_dir, output)
-    _sync_registry(config, args.standard_id, artifact_dir)
+    files = service.write_outputs(
+        graph_space_dir,
+        output,
+        artifact_dir=artifact_dir,
+        standard_uid=args.standard_id,
+        document_id=artifact_dir.name,
+    )
+    _sync_registry(config, args.standard_id, artifact_dir, graph_space_dir)
 
     print('artifact_dir', artifact_dir)
+    print('graph_space_dir', graph_space_dir)
     print('normalized_blocks', len(output.normalized_blocks))
     print('structure_nodes', len(output.structure_nodes))
     print('clauses', len(output.clauses))

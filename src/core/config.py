@@ -3,11 +3,12 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 import os
+import re
 from typing import Any, Literal
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -24,6 +25,7 @@ class StorageConfig(BaseModel):
     jobs_dir: str = "data/jobs"
     artifacts_dir: str = "data/artifacts"
     downloads_dir: str = "data/downloads"
+    kg_spaces_dir: str = "data/kg_spaces"
     registry_path: str = "data/registry/standards.json"
 
 
@@ -92,7 +94,7 @@ class PostgresConfig(BaseModel):
     enabled: bool = False
     host: str = "127.0.0.1"
     port: int = 5433
-    database: str = "kg_agent_hhu"
+    database: str = "normagraph"
     user: str = "postgres"
     password_env: str = "POSTGRES_PASSWORD"
     password: str | None = Field(default=None, repr=False)
@@ -136,6 +138,10 @@ class AppConfig(BaseModel):
         return self.root_dir / self.storage.downloads_dir
 
     @property
+    def kg_spaces_dir(self) -> Path:
+        return self.root_dir / self.storage.kg_spaces_dir
+
+    @property
     def registry_path(self) -> Path:
         return self.root_dir / self.storage.registry_path
 
@@ -146,6 +152,21 @@ class AppConfig(BaseModel):
     @property
     def schema_dir(self) -> Path:
         return self.resource_dir / "schemas"
+
+    def artifact_dir_for(self, document_id: str) -> Path:
+        return self.artifacts_dir / self._safe_storage_segment(document_id)
+
+    def download_work_dir_for(self, document_id: str, job_id: str) -> Path:
+        return self.downloads_dir / self._safe_storage_segment(document_id) / self._safe_storage_segment(job_id)
+
+    def kg_space_dir_for(self, standard_id: str) -> Path:
+        return self.kg_spaces_dir / self._safe_storage_segment(standard_id)
+
+    @staticmethod
+    def _safe_storage_segment(value: str) -> str:
+        sanitized = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip().lower()).strip("-")
+        return sanitized or "unknown"
+
 
 def _load_yaml_config(path: Path) -> dict[str, Any]:
     if not path.exists():
@@ -191,12 +212,9 @@ def get_config() -> AppConfig:
         config.jobs_dir,
         config.artifacts_dir,
         config.downloads_dir,
+        config.kg_spaces_dir,
         config.registry_path.parent,
         config.schema_dir,
     ]:
         directory.mkdir(parents=True, exist_ok=True)
     return config
-
-
-
-

@@ -8,6 +8,7 @@ storage:
   jobs_dir: "data/jobs"
   artifacts_dir: "data/artifacts"
   downloads_dir: "data/downloads"
+  kg_spaces_dir: "data/kg_spaces"
   registry_path: "data/registry/standards.json"
 
 mineru:
@@ -74,7 +75,7 @@ postgres:
   enabled: false
   host: "127.0.0.1"
   port: 5433
-  database: "kg_agent_hhu"
+  database: "normagraph"
   user: "postgres"
   password_env: "POSTGRES_PASSWORD"
   schema: "kg"

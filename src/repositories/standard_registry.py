@@ -36,6 +36,12 @@ class StandardRegistry:
             return None
         return StandardDetail.model_validate(item)
 
+    def find_by_document_id(self, document_id: str) -> StandardDetail | None:
+        for item in self._read().values():
+            if item.get("documentId") == document_id:
+                return StandardDetail.model_validate(item)
+        return None
+
     def upsert(self, detail: StandardDetail) -> None:
         data = self._read()
         data[detail.standardId] = detail.model_dump(mode="json")

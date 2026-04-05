@@ -67,7 +67,7 @@ def artifact_index(artifact_dir: Path) -> dict[str, str]:
     return artifacts
 
 
-def sync_registry(config, registry: StandardRegistry, standard_id: str, source_path: Path, document_id: str, artifact_dir: Path) -> None:
+def sync_registry(config, registry: StandardRegistry, standard_id: str, source_path: Path, document_id: str, artifact_dir: Path, graph_space_dir: Path) -> None:
     existing = registry.get(standard_id)
     detected = registry.detect_from_filename(source_path.name)
     code = existing.code if existing else (detected[1] if detected else standard_id.split(":")[0].upper())
@@ -83,7 +83,7 @@ def sync_registry(config, registry: StandardRegistry, standard_id: str, source_p
         effectiveDate=existing.effectiveDate if existing else None,
         documentId=document_id,
         artifactDir=str(artifact_dir),
-        derivedDir=str(artifact_dir / "derived"),
+        graphSpaceDir=str(graph_space_dir),
         graphStatus="ready",
         latestJobId=existing.latestJobId if existing else None,
     )
@@ -120,8 +120,8 @@ async def run() -> int:
     source_format = args.source_format or infer_source_format(source_path)
     document_id = make_document_id(source_path)
     run_id = str(uuid.uuid4())
-    work_dir = config.downloads_dir / document_id / run_id
-    artifact_dir = config.artifacts_dir / document_id
+    work_dir = config.download_work_dir_for(document_id, run_id)
+    artifact_dir = config.artifact_dir_for(document_id)
     work_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
@@ -242,10 +242,18 @@ async def run() -> int:
             standard_id = args.standard_id or (detected[0] if detected else None)
             if not standard_id:
                 raise ValueError("Failed to infer standard_id from filename. Please pass --standard-id explicitly.")
+            graph_space_dir = config.kg_space_dir_for(standard_id)
             log_step(f"Step 6/6 Build KG | standard_id={standard_id}")
+            log_step(f"graph_space_dir={graph_space_dir}")
             output = pipeline_service.run(artifact_dir, standard_id)
-            files = pipeline_service.write_outputs(artifact_dir, output)
-            sync_registry(config, registry, standard_id, source_path, document_id, artifact_dir)
+            files = pipeline_service.write_outputs(
+                graph_space_dir,
+                output,
+                artifact_dir=artifact_dir,
+                standard_uid=standard_id,
+                document_id=document_id,
+            )
+            sync_registry(config, registry, standard_id, source_path, document_id, artifact_dir, graph_space_dir)
             log_step(
                 "graph_metrics="
                 + json.dumps(
@@ -262,7 +270,7 @@ async def run() -> int:
             )
             if output.extraction_warnings:
                 log_step("extraction_warnings=" + json.dumps(output.extraction_warnings, ensure_ascii=False))
-            log_step("derived_files=" + json.dumps({key: str(path) for key, path in files.items()}, ensure_ascii=False))
+            log_step("graph_space_files=" + json.dumps({key: str(path) for key, path in files.items()}, ensure_ascii=False))
             log_step(f"Step 6 done in {time.perf_counter() - step_started:.2f}s")
         else:
             log_step("Step 6/6 skipped (build_graph disabled or document_type is report)")

@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>KG Artifact Viewer</title>
+    <title>KG Graph Space Viewer</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
@@ -15,19 +15,19 @@
             <h1>知识图谱展示台</h1>
             <p class="hero-text">
               独立于当前后端接口，只消费 <code>graph_nodes.json</code>、<code>graph_edges.json</code>
-              和可选的 <code>requirements.json</code>。适合直接展示 artifact 效果、浏览实体关系、查看节点详情。
+              和可选的 <code>requirements.json</code>。适合直接展示图谱空间效果、浏览实体关系、查看节点详情。
             </p>
           </div>
           <div class="hero-loader" aria-label="图谱数据加载入口">
             <label class="loader-button loader-button-primary">
               <span class="loader-kicker">推荐方式</span>
-              <strong>选择 artifact 目录</strong>
-              <small>直接选中 <code>data/artifacts/&lt;artifact_id&gt;</code>，自动读取 <code>derived</code> 下图谱文件</small>
+              <strong>选择图谱空间目录</strong>
+              <small>直接选中 <code>data/kg_spaces/&lt;standard_id&gt;</code></small>
               <input id="folder-input" type="file" webkitdirectory multiple />
             </label>
             <div class="loader-note">
               <strong>一键加载</strong>
-              <span>无需单独选择节点或边文件，也支持直接选择 <code>derived</code> 目录。</span>
+              <span>无需单独选择节点或边文件。</span>
             </div>
             <details class="advanced-import">
               <summary>高级导入</summary>
@@ -120,8 +120,8 @@
           </div>
           <div class="graph-stage-wrap">
             <div id="graph-empty" class="graph-empty-state">
-              <h3>加载一个 artifact 开始浏览</h3>
-              <p>推荐直接选择 <code>data/artifacts/&lt;artifact_id&gt;</code> 或其 <code>derived</code> 目录，页面会自动读取图谱文件。</p>
+              <h3>加载一个图谱空间开始浏览</h3>
+              <p>推荐直接选择 <code>data/kg_spaces/&lt;standard_id&gt;</code>，页面会自动读取图谱文件。</p>
             </div>
             <svg id="graph-stage" class="graph-stage" viewBox="0 0 1200 760" preserveAspectRatio="xMidYMid meet"></svg>
           </div>

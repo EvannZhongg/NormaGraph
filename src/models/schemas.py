@@ -52,7 +52,7 @@ class StandardDetail(StandardSummary):
     effectiveDate: str | None = None
     documentId: str | None = None
     artifactDir: str | None = None
-    derivedDir: str | None = None
+    graphSpaceDir: str | None = None
     graphStatus: Literal["not_built", "building", "ready", "failed"] = "not_built"
     latestJobId: str | None = None
 

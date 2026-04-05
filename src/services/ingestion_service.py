@@ -81,11 +81,14 @@ class IngestionService:
         job.progress = 0.05
         self._touch(job)
 
-        work_dir = self.config.downloads_dir / job.documentId / job.jobId
+        work_dir = self.config.download_work_dir_for(job.documentId, job.jobId)
         work_dir.mkdir(parents=True, exist_ok=True)
-        artifact_dir = self.config.artifacts_dir / job.documentId
+        artifact_dir = self.config.artifact_dir_for(job.documentId)
         artifact_dir.mkdir(parents=True, exist_ok=True)
         detected_standard = self._detect_standard(source_path) if request.documentType == "standard" else None
+        graph_space_dir = self.config.kg_space_dir_for(detected_standard[0]) if detected_standard else None
+        if graph_space_dir is not None:
+            job.result["graph_space_dir"] = str(graph_space_dir)
 
         try:
             normalization = self.normalization_service.normalize(source_path, request, work_dir)
@@ -124,47 +127,92 @@ class IngestionService:
             job.result["artifacts"] = self._artifact_index(artifact_dir)
 
             if detected_standard:
-                self._upsert_standard_detail(source_path, job, detected_standard, artifact_dir, "building" if request.buildGraph else "not_built")
+                self._upsert_standard_detail(
+                    source_path,
+                    job,
+                    detected_standard,
+                    artifact_dir,
+                    "building" if request.buildGraph else "not_built",
+                    graph_space_dir=graph_space_dir,
+                )
 
             if request.buildGraph and request.documentType == "standard":
                 job.progress = 0.88
                 self._touch(job)
-                self._build_standard_graph(job, source_path, artifact_dir, detected_standard)
+                self._build_standard_graph(job, source_path, artifact_dir, detected_standard, graph_space_dir)
 
             if detected_standard and not request.buildGraph:
-                self._upsert_standard_detail(source_path, job, detected_standard, artifact_dir, "not_built")
+                self._upsert_standard_detail(
+                    source_path,
+                    job,
+                    detected_standard,
+                    artifact_dir,
+                    "not_built",
+                    graph_space_dir=graph_space_dir,
+                )
 
             job.progress = 1.0
             job.status = "succeeded"
             self._touch(job)
         except Exception as exc:
             if detected_standard:
-                self._upsert_standard_detail(source_path, job, detected_standard, artifact_dir, "failed")
+                self._upsert_standard_detail(
+                    source_path,
+                    job,
+                    detected_standard,
+                    artifact_dir,
+                    "failed",
+                    graph_space_dir=graph_space_dir,
+                )
             job.status = "failed"
             job.error = str(exc)
             job.progress = max(job.progress, 0.01)
             self._touch(job)
+
     def _build_standard_graph(
         self,
         job: IngestionJob,
         source_path: Path,
         artifact_dir: Path,
         detected_standard: tuple[str, str, str] | None,
+        graph_space_dir: Path | None,
     ) -> None:
         if not detected_standard:
             job.result["graph_warning"] = "Standard ID could not be detected from filename; graph build skipped."
             return
+        if graph_space_dir is None:
+            job.result["graph_warning"] = "Graph space directory could not be resolved; graph build skipped."
+            return
+
         standard_id = detected_standard[0]
         output = self.standard_pipeline_service.run(artifact_dir, standard_id)
-        files = self.standard_pipeline_service.write_outputs(artifact_dir, output)
+        files = self.standard_pipeline_service.write_outputs(
+            graph_space_dir,
+            output,
+            artifact_dir=artifact_dir,
+            standard_uid=standard_id,
+            document_id=job.documentId,
+        )
         job.result["graph"] = {
             "standard_id": standard_id,
+            "graph_space_dir": str(graph_space_dir),
             "metrics": output.metrics,
             "warnings": output.extraction_warnings,
             "files": {key: str(path) for key, path in files.items()},
         }
+        job.result["graph_space"] = {
+            "dir": str(graph_space_dir),
+            "files": self._artifact_index(graph_space_dir),
+        }
         job.result["artifacts"] = self._artifact_index(artifact_dir)
-        self._upsert_standard_detail(source_path, job, detected_standard, artifact_dir, "ready")
+        self._upsert_standard_detail(
+            source_path,
+            job,
+            detected_standard,
+            artifact_dir,
+            "ready",
+            graph_space_dir=graph_space_dir,
+        )
 
     async def _poll_for_result(self, job: IngestionJob, batch_id: str, file_name: str) -> dict:
         deadline = asyncio.get_running_loop().time() + self.config.mineru.poll_timeout_seconds
@@ -211,11 +259,14 @@ class IngestionService:
         detected_standard: tuple[str, str, str],
         artifact_dir: Path,
         graph_status: str,
+        *,
+        graph_space_dir: Path | None = None,
     ) -> None:
         standard_id, code, title = detected_standard
         existing = self.registry.get(standard_id)
         aliases = set(existing.aliases if existing else [])
         aliases.add(source_path.name)
+        resolved_graph_space_dir = str(graph_space_dir) if graph_space_dir else self._graph_space_path(existing)
         detail = StandardDetail(
             standardId=standard_id,
             code=code,
@@ -225,7 +276,7 @@ class IngestionService:
             effectiveDate=existing.effectiveDate if existing else None,
             documentId=job.documentId,
             artifactDir=str(artifact_dir),
-            derivedDir=str(artifact_dir / "derived"),
+            graphSpaceDir=resolved_graph_space_dir,
             graphStatus=graph_status,
             latestJobId=job.jobId,
         )
@@ -274,14 +325,14 @@ class IngestionService:
                 artifacts[path.relative_to(artifact_dir).as_posix()] = str(path)
         return artifacts
 
-
     def get_standard_subgraph(self, standard_id: str, node_id: str | None = None, depth: int = 2) -> dict[str, list[dict]] | None:
         detail = self.registry.get(standard_id)
-        if detail is None or not detail.derivedDir:
+        graph_space_dir = self._resolve_graph_space_dir(detail)
+        if graph_space_dir is None:
             return None
-        derived_dir = Path(detail.derivedDir)
-        nodes_path = derived_dir / 'graph_nodes.json'
-        edges_path = derived_dir / 'graph_edges.json'
+
+        nodes_path = graph_space_dir / 'graph_nodes.json'
+        edges_path = graph_space_dir / 'graph_edges.json'
         if not nodes_path.exists() or not edges_path.exists():
             return None
 
@@ -320,9 +371,11 @@ class IngestionService:
         if standard_id is None:
             return None
         detail = self.registry.get(standard_id)
-        if detail is None or not detail.derivedDir:
+        graph_space_dir = self._resolve_graph_space_dir(detail)
+        if graph_space_dir is None:
             return None
-        requirements_path = Path(detail.derivedDir) / 'requirements.json'
+
+        requirements_path = graph_space_dir / 'requirements.json'
         if not requirements_path.exists():
             return None
         requirements = json.loads(requirements_path.read_text(encoding='utf-8'))
@@ -354,5 +407,16 @@ class IngestionService:
             return None
         return ':'.join(parts[:2])
 
+    def _resolve_graph_space_dir(self, detail: StandardDetail | None) -> Path | None:
+        if detail is None:
+            return None
+        graph_space = self._graph_space_path(detail)
+        if not graph_space:
+            return None
+        path = Path(graph_space)
+        return path if path.exists() else None
 
-
+    def _graph_space_path(self, detail: StandardDetail | None) -> str | None:
+        if detail is None:
+            return None
+        return detail.graphSpaceDir

@@ -165,7 +165,7 @@ async function readDatasetFiles(files) {
   const edgesFile = pickDatasetFile(files, 'graph_edges.json');
   const requirementsFile = pickDatasetFile(files, 'requirements.json');
   if (!nodesFile || !edgesFile) {
-    throw new Error('没有找到 graph_nodes.json 或 graph_edges.json。');
+    throw new Error('没有找到 graph_nodes.json 或 graph_edges.json，请选择图谱空间目录。');
   }
   const [nodes, edges, requirements] = await Promise.all([
     readJsonFile(nodesFile),
@@ -254,7 +254,7 @@ function renderEmptyShell() {
   refs.detailProperties.innerHTML = '<div class="empty-note">加载后会展示结构化属性。</div>';
   refs.detailRequirements.innerHTML = '<div class="empty-note">选中 clause 或 requirement 后会出现关联 requirement。</div>';
   refs.detailNeighbors.innerHTML = '<div class="empty-note">选中节点后会出现一跳相邻节点。</div>';
-  showGraphEmpty('选择 artifact 根目录或 derived 目录后即可开始浏览。');
+  showGraphEmpty('选择图谱空间目录后即可开始浏览。');
 }
 
 function renderSummary() {
@@ -758,8 +758,8 @@ function guessFolderLabel(relativePath) {
   if (derivedIndex > 0) {
     return segments[derivedIndex - 1];
   }
-  if (segments.length >= 2 && segments[0] !== 'derived') {
-    return segments[0];
+  if (segments.length >= 2) {
+    return segments[segments.length - 2];
   }
   return normalizedPath;
 }
@@ -787,12 +787,6 @@ function pickDatasetFile(files, filename) {
 
 function scoreDatasetFile(file, filename) {
   const path = (file.webkitRelativePath || file.name).replace(/\\/g, '/').toLowerCase();
-  if (path.endsWith(`/derived/${filename}`)) {
-    return 3;
-  }
-  if (path.includes('/derived/')) {
-    return 2;
-  }
   if (path === filename || path.endsWith(`/${filename}`)) {
     return 1;
   }
