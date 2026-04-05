@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>KG Artifact Viewer</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="hero-panel">
+        <div class="hero-top">
+          <div class="hero-copy">
+            <p class="eyebrow">Standalone Graph Viewer</p>
+            <h1>知识图谱展示台</h1>
+            <p class="hero-text">
+              独立于当前后端接口，只消费 <code>graph_nodes.json</code>、<code>graph_edges.json</code>
+              和可选的 <code>requirements.json</code>。适合直接展示 artifact 效果、浏览实体关系、查看节点详情。
+            </p>
+          </div>
+          <div class="hero-loader" aria-label="图谱数据加载入口">
+            <label class="loader-button loader-button-primary">
+              <span class="loader-kicker">推荐方式</span>
+              <strong>选择 artifact 目录</strong>
+              <small>直接选中 <code>data/artifacts/&lt;artifact_id&gt;</code>，自动读取 <code>derived</code> 下图谱文件</small>
+              <input id="folder-input" type="file" webkitdirectory multiple />
+            </label>
+            <div class="loader-note">
+              <strong>一键加载</strong>
+              <span>无需单独选择节点或边文件，也支持直接选择 <code>derived</code> 目录。</span>
+            </div>
+            <details class="advanced-import">
+              <summary>高级导入</summary>
+              <label class="advanced-import-panel">
+                <span>批量选择 JSON 文件</span>
+                <small>一次选择 <code>graph_nodes.json</code>、<code>graph_edges.json</code>，<code>requirements.json</code> 可选</small>
+                <input id="manual-files-input" type="file" accept=".json,application/json" multiple />
+              </label>
+            </details>
+          </div>
+        </div>
+      </header>
+
+      <section class="status-strip">
+        <div>
+          <span class="status-label">加载来源</span>
+          <strong id="data-source">尚未加载</strong>
+        </div>
+        <div>
+          <span class="status-label">当前节点</span>
+          <strong id="selection-status">未选择</strong>
+        </div>
+        <div>
+          <span class="status-label">邻域深度</span>
+          <strong id="depth-indicator">1 跳</strong>
+        </div>
+      </section>
+
+      <main class="workspace-grid">
+        <aside class="panel sidebar-panel">
+          <section class="panel-section">
+            <div class="section-heading">
+              <h2>概览</h2>
+              <span id="summary-pill" class="pill">待加载</span>
+            </div>
+            <div id="stats-grid" class="stats-grid"></div>
+          </section>
+
+          <section class="panel-section">
+            <div class="section-heading">
+              <h2>过滤器</h2>
+              <button id="reset-filters" class="ghost-button" type="button">重置</button>
+            </div>
+            <label class="field-label" for="search-input">搜索节点</label>
+            <input id="search-input" class="search-input" type="search" placeholder="按 UID、标题、正文搜索" />
+            <div class="range-row">
+              <label>
+                <span>邻域深度</span>
+                <select id="depth-select">
+                  <option value="1">1 跳</option>
+                  <option value="2">2 跳</option>
+                </select>
+              </label>
+              <label>
+                <span>显示上限</span>
+                <select id="neighbor-limit-select">
+                  <option value="18">18</option>
+                  <option value="30" selected>30</option>
+                  <option value="48">48</option>
+                  <option value="72">72</option>
+                </select>
+              </label>
+            </div>
+            <div>
+              <p class="mini-label">节点类型</p>
+              <div id="type-filters" class="chip-cluster"></div>
+            </div>
+            <div>
+              <p class="mini-label">边类型</p>
+              <div id="edge-filters" class="chip-cluster"></div>
+            </div>
+          </section>
+
+          <section class="panel-section node-list-section">
+            <div class="section-heading">
+              <h2>节点清单</h2>
+              <span id="list-count" class="muted-count">0</span>
+            </div>
+            <div id="node-list" class="node-list"></div>
+          </section>
+        </aside>
+
+        <section class="panel graph-panel">
+          <div class="panel-toolbar">
+            <div>
+              <p class="toolbar-label">Neighborhood Graph</p>
+              <h2 id="graph-title">等待数据</h2>
+            </div>
+            <button id="focus-standard-button" class="ghost-button" type="button">回到标准根节点</button>
+          </div>
+          <div class="graph-stage-wrap">
+            <div id="graph-empty" class="graph-empty-state">
+              <h3>加载一个 artifact 开始浏览</h3>
+              <p>推荐直接选择 <code>data/artifacts/&lt;artifact_id&gt;</code> 或其 <code>derived</code> 目录，页面会自动读取图谱文件。</p>
+            </div>
+            <svg id="graph-stage" class="graph-stage" viewBox="0 0 1200 760" preserveAspectRatio="xMidYMid meet"></svg>
+          </div>
+          <div id="legend" class="legend-strip"></div>
+        </section>
+
+        <aside class="panel detail-panel">
+          <section class="panel-section detail-header-section">
+            <div class="section-heading">
+              <h2>节点详情</h2>
+              <span id="detail-type" class="pill pill-muted">未选择</span>
+            </div>
+            <h3 id="detail-title" class="detail-title">请先选择一个节点</h3>
+            <p id="detail-uid" class="detail-uid">节点 UID 会显示在这里</p>
+          </section>
+
+          <section class="panel-section">
+            <div class="section-heading">
+              <h2>文本快照</h2>
+            </div>
+            <pre id="detail-text" class="detail-text">暂无内容</pre>
+          </section>
+
+          <section class="panel-section">
+            <div class="section-heading">
+              <h2>结构化属性</h2>
+            </div>
+            <div id="detail-properties" class="property-grid"></div>
+          </section>
+
+          <section class="panel-section">
+            <div class="section-heading">
+              <h2>关联 requirement</h2>
+            </div>
+            <div id="detail-requirements" class="detail-cards"></div>
+          </section>
+
+          <section class="panel-section">
+            <div class="section-heading">
+              <h2>相邻节点</h2>
+            </div>
+            <div id="detail-neighbors" class="detail-cards"></div>
+          </section>
+        </aside>
+      </main>
+    </div>
+
+    <template id="stat-card-template">
+      <article class="stat-card">
+        <span class="stat-label"></span>
+        <strong class="stat-value"></strong>
+        <small class="stat-sub"></small>
+      </article>
+    </template>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

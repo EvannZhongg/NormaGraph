@@ -1,0 +1,81 @@
+server:
+  host: "127.0.0.1"
+  port: 8010
+  reload: false
+
+storage:
+  data_dir: "data"
+  jobs_dir: "data/jobs"
+  artifacts_dir: "data/artifacts"
+  downloads_dir: "data/downloads"
+  registry_path: "data/registry/standards.json"
+
+mineru:
+  default_endpoint: "https://mineru.net"
+  api_prefix: "/api/v4"
+  model_version: "vlm"
+  language: "ch"
+  enable_formula: true
+  enable_table: true
+  is_ocr: true
+  request_timeout_seconds: 120
+  poll_interval_seconds: 8
+  poll_timeout_seconds: 900
+  result_download_timeout_seconds: 300
+  poll_request_retries: 5
+  retry_backoff_seconds: 3
+
+normalization:
+  localhost_hosts:
+    - "localhost"
+    - "127.0.0.1"
+  local_doc_to_pdf:
+    enabled: false
+    command: []
+
+knowledge_graph:
+  extraction_mode: "llm"
+  fallback_to_heuristic_on_llm_error: true
+  include_appendix_requirements: false
+  materialize_graph: true
+
+llm:
+  enabled: true
+  provider: "openai_responses"
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  model: "qwen3.5-plus"
+  structured_output_mode: "response_format"
+  enable_thinking: false
+  temperature: 0.0
+  max_output_tokens: 6000
+  timeout_seconds: 180
+  clause_batch_size: 6
+  batch_max_retries: 5
+  batch_retry_backoff_seconds: 2.0
+  batch_max_concurrency: 4
+  api_key_env: "LLM_API_KEY"
+  organization_env:
+  project_env:
+
+embedding:
+  enabled: true
+  provider: "openai_embeddings"
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  model: "text-embedding-v4"
+  dimensions: 1024
+  timeout_seconds: 120
+  batch_size: 10
+  api_key_env: "EMBED_API_KEY"
+  target_node_types:
+    - "clause"
+    - "requirement"
+
+postgres:
+  enabled: false
+  host: "127.0.0.1"
+  port: 5433
+  database: "kg_agent_hhu"
+  user: "postgres"
+  password_env: "POSTGRES_PASSWORD"
+  schema: "kg"
+  sslmode: "prefer"

@@ -1,0 +1,489 @@
+openapi: 3.1.0
+info:
+  title: Dam Safety KG Agent API
+  version: 0.1.0
+  summary: 面向规范建图、报告对比、QA/RAG 的预留接口
+servers:
+  - url: http://localhost:8010
+paths:
+  /v1/ingestions:
+    post:
+      summary: 提交文档解析或建图任务
+      operationId: createIngestionJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateIngestionJobRequest'
+      responses:
+        '202':
+          description: accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestionJob'
+  /v1/ingestions/{jobId}:
+    get:
+      summary: 查询解析或建图任务状态
+      operationId: getIngestionJob
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestionJob'
+  /v1/standards:
+    get:
+      summary: 查询已注册规范列表
+      operationId: listStandards
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/StandardSummary'
+                required:
+                  - items
+  /v1/standards/{standardId}:
+    get:
+      summary: 查询规范详情
+      operationId: getStandard
+      parameters:
+        - $ref: '#/components/parameters/StandardId'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardDetail'
+  /v1/standards/{standardId}/subgraph:
+    get:
+      summary: 拉取某规范的局部子图
+      operationId: getStandardSubgraph
+      parameters:
+        - $ref: '#/components/parameters/StandardId'
+        - name: nodeId
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: depth
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 4
+            default: 2
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubgraphResponse'
+  /v1/requirements/{requirementId}:
+    get:
+      summary: 查询单条规范要求详情
+      operationId: getRequirement
+      parameters:
+        - $ref: '#/components/parameters/RequirementId'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequirementDetail'
+  /v1/qa/ask:
+    post:
+      summary: 规范问答
+      operationId: askQuestion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuestionRequest'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuestionResponse'
+  /v1/comparisons:
+    post:
+      summary: 提交报告与规范的对比任务
+      operationId: createComparison
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateComparisonRequest'
+      responses:
+        '202':
+          description: accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ComparisonSummary'
+  /v1/comparisons/{comparisonId}:
+    get:
+      summary: 查询报告对比摘要
+      operationId: getComparison
+      parameters:
+        - $ref: '#/components/parameters/ComparisonId'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ComparisonSummary'
+  /v1/comparisons/{comparisonId}/items:
+    get:
+      summary: 查询报告对比明细项
+      operationId: listComparisonItems
+      parameters:
+        - $ref: '#/components/parameters/ComparisonId'
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [covered, partial, missing, unknown]
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: pageSize
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ComparisonItem'
+                  total:
+                    type: integer
+                required:
+                  - items
+                  - total
+components:
+  parameters:
+    JobId:
+      name: jobId
+      in: path
+      required: true
+      schema:
+        type: string
+    StandardId:
+      name: standardId
+      in: path
+      required: true
+      schema:
+        type: string
+    RequirementId:
+      name: requirementId
+      in: path
+      required: true
+      schema:
+        type: string
+    ComparisonId:
+      name: comparisonId
+      in: path
+      required: true
+      schema:
+        type: string
+  schemas:
+    CreateIngestionJobRequest:
+      type: object
+      properties:
+        documentType:
+          type: string
+          enum: [standard, report]
+        sourcePath:
+          type: string
+        sourceFormat:
+          type: string
+          enum: [pdf, doc, docx]
+        parserProvider:
+          type: string
+          enum: [mineru_api]
+        parserEndpoint:
+          type: string
+          description: MinerU API endpoint; if localhost or 127.0.0.1, the adapter may apply local preprocessing such as doc-to-pdf.
+        normalizationPolicy:
+          type: string
+          enum: [auto, none, force_pdf_for_localhost]
+          default: auto
+        buildGraph:
+          type: boolean
+          default: true
+        metadata:
+          type: object
+          additionalProperties: true
+      required:
+        - documentType
+        - sourcePath
+        - sourceFormat
+        - parserProvider
+    IngestionJob:
+      type: object
+      properties:
+        jobId:
+          type: string
+        status:
+          type: string
+          enum: [queued, running, succeeded, failed]
+        documentId:
+          type: string
+        documentType:
+          type: string
+          enum: [standard, report]
+        parserProvider:
+          type: string
+        parserEndpoint:
+          type: string
+        normalizedFormat:
+          type: string
+          enum: [pdf, doc, docx]
+        preprocessingActions:
+          type: array
+          items:
+            type: string
+        progress:
+          type: number
+        result:
+          type: object
+          additionalProperties: true
+        error:
+          type: string
+      required:
+        - jobId
+        - status
+        - documentId
+        - documentType
+        - progress
+    StandardSummary:
+      type: object
+      properties:
+        standardId:
+          type: string
+        code:
+          type: string
+        year:
+          type: string
+        title:
+          type: string
+      required:
+        - standardId
+        - code
+        - title
+    StandardDetail:
+      allOf:
+        - $ref: '#/components/schemas/StandardSummary'
+        - type: object
+          properties:
+            aliases:
+              type: array
+              items:
+                type: string
+            effectiveDate:
+              type: string
+              format: date
+            documentId:
+              type: string
+            graphStatus:
+              type: string
+              enum: [not_built, building, ready, failed]
+    SubgraphResponse:
+      type: object
+      properties:
+        nodes:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        edges:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+      required:
+        - nodes
+        - edges
+    RequirementDetail:
+      type: object
+      properties:
+        requirementId:
+          type: string
+        standardId:
+          type: string
+        clauseRef:
+          type: string
+        requirementText:
+          type: string
+        modality:
+          type: string
+          enum: [must, should, may, forbidden, conditional]
+        applicabilityRule:
+          type: string
+        judgementCriteria:
+          type: array
+          items:
+            type: string
+        evidenceExpected:
+          type: array
+          items:
+            type: string
+        citations:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        sourceSpans:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+      required:
+        - requirementId
+        - standardId
+        - clauseRef
+        - requirementText
+    QuestionRequest:
+      type: object
+      properties:
+        question:
+          type: string
+        standardIds:
+          type: array
+          items:
+            type: string
+        expandCitations:
+          type: boolean
+          default: true
+      required:
+        - question
+    QuestionResponse:
+      type: object
+      properties:
+        answer:
+          type: string
+        standardIds:
+          type: array
+          items:
+            type: string
+        citations:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        graphHops:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+      required:
+        - answer
+        - citations
+    CreateComparisonRequest:
+      type: object
+      properties:
+        reportDocumentId:
+          type: string
+        targetStandardIds:
+          type: array
+          items:
+            type: string
+        projectContext:
+          type: object
+          additionalProperties: true
+        autoRouteStandards:
+          type: boolean
+          default: true
+      required:
+        - reportDocumentId
+    ComparisonSummary:
+      type: object
+      properties:
+        comparisonId:
+          type: string
+        status:
+          type: string
+          enum: [queued, running, succeeded, failed]
+        reportDocumentId:
+          type: string
+        targetStandardIds:
+          type: array
+          items:
+            type: string
+        summary:
+          type: object
+          properties:
+            covered:
+              type: integer
+            partial:
+              type: integer
+            missing:
+              type: integer
+            unknown:
+              type: integer
+      required:
+        - comparisonId
+        - status
+        - reportDocumentId
+    ComparisonItem:
+      type: object
+      properties:
+        requirementId:
+          type: string
+        status:
+          type: string
+          enum: [covered, partial, missing, unknown]
+        reason:
+          type: string
+        suggestion:
+          type: string
+        evidenceNodeIds:
+          type: array
+          items:
+            type: string
+        citations:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+      required:
+        - requirementId
+        - status
+

@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClauseGraphExtractionBatch",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "clause_uid": {
+            "type": "string"
+          },
+          "clause_ref": {
+            "type": "string"
+          },
+          "clause_summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "concepts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "requirements": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "requirement_text": {
+                  "type": "string"
+                },
+                "modality": {
+                  "type": "string",
+                  "enum": [
+                    "must",
+                    "should",
+                    "may",
+                    "forbidden",
+                    "conditional"
+                  ]
+                },
+                "subject": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "action": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "object": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "applicability_rule": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "judgement_criteria": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "evidence_expected": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "domain_tags": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "cited_targets": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "standard_code": {
+                        "type": "string"
+                      },
+                      "clause_ref": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "citation_type": {
+                        "type": "string",
+                        "enum": [
+                          "mandatory",
+                          "informative",
+                          "background",
+                          "unknown"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "standard_code",
+                      "citation_type"
+                    ]
+                  }
+                },
+                "confidence": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              },
+              "required": [
+                "requirement_text",
+                "modality",
+                "action",
+                "object",
+                "judgement_criteria",
+                "evidence_expected",
+                "domain_tags",
+                "cited_targets",
+                "confidence"
+              ]
+            }
+          }
+        },
+        "required": [
+          "clause_uid",
+          "clause_ref",
+          "concepts",
+          "requirements"
+        ]
+      }
+    }
+  },
+  "required": [
+    "items"
+  ]
+}
