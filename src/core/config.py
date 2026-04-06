@@ -85,6 +85,8 @@ class EmbeddingConfig(BaseModel):
     dimensions: int = 1536
     timeout_seconds: int = 120
     batch_size: int = 24
+    max_retries: int = 2
+    retry_backoff_seconds: float = 2.0
     api_key_env: str = "OPENAI_API_KEY"
     api_key: str | None = Field(default=None, repr=False)
     target_node_types: list[str] = Field(default_factory=lambda: ["clause", "requirement"])

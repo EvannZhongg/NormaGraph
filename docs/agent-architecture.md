@@ -1,4 +1,4 @@
-# 水库大坝规范知识图谱与智能体架构设计
+# 规范知识图谱与智能体架构设计
 
 ## 1. 当前实现状态
 
@@ -13,11 +13,12 @@
 - 已有 LLM 抽取链路，统一走 OpenAI 兼容的 `responses` 风格接口。
 - 已有结构化输出兼容层，可兼容 `items / results / clauses / extracted_requirements` 等返回形状。
 - 已有 batch 级重试、退避与并发控制，并保证最终结果按原始条文顺序归并。
-- 已有图谱物化输出：`requirements.json`、`graph_nodes.json`、`graph_edges.json`、`embedding_inputs.jsonl`。
-- 已有 embedding 生成链路，受配置控制。
+- 已有图谱物化输出：`requirements.json`、`graph_nodes.json`、`graph_edges.json`、`embedding_inputs.jsonl`、`embedding_store.jsonl`。
+- 已有 embedding 生成链路，受配置控制；当 PostgreSQL 关闭时会额外保留本地 JSONL 向量快照。
 - 已有 PostgreSQL / pgvector 持久化原型，受配置控制，当前默认关闭。
+- 当 PostgreSQL 开启时，若目标数据库不存在，首次落库会自动完成建库和基础 schema 初始化。
 - 已有面向前端读取的接口：标准列表、标准详情、子图查询、requirement 明细查询。
-- 已有不依赖后端 API 的静态图谱前端，可直接加载 artifact 目录展示节点详情和局部关系。
+- 已有不依赖后端 API 的静态图谱前端，可直接加载标准图谱空间目录展示节点详情和局部关系。
 - 已有前台调试脚本，可直接观察标准化、上传、轮询、抽取、建图和输出文件路径。
 
 当前尚未完成的能力：
@@ -81,17 +82,18 @@
 flowchart LR
     A[源文件 PDF DOC DOCX] --> B[Normalization]
     B --> C[MinerU Online API]
-    C --> D[Artifact 归档]
+    C --> D[data/artifacts/<document_id>]
     D --> E[content_list_v2.json 归一化]
     E --> F[结构树恢复]
     F --> G[条文切分]
     G --> H[LLM / Heuristic requirement extraction]
     H --> I[Graph materialization]
-    I --> J[requirements.json]
-    I --> K[graph_nodes.json / graph_edges.json]
-    I --> L[embedding_inputs.jsonl]
-    I --> M[Embeddings Optional]
-    M --> N[PostgreSQL / pgvector Optional]
+    I --> J[data/kg_spaces/<standard_id>]
+    J --> K[requirements.json / graph_nodes.json / graph_edges.json]
+    J --> L[embedding_inputs.jsonl]
+    L --> M[Embeddings Optional]
+    M --> N[embedding_store.jsonl Optional]
+    M --> P[PostgreSQL / pgvector Optional]
     K --> O[Static Viewer / FastAPI Subgraph API]
 ```
 
@@ -101,7 +103,21 @@ flowchart LR
 - 结构树恢复不依赖 Markdown `#` 层级，而是优先依赖编号语义与 `content_list_v2.json` 块结构。
 - requirement extraction 支持三种模式：`heuristic`、`llm`、`hybrid`。
 - 当前推荐运行策略是 `llm + fallback_to_heuristic_on_llm_error=true`。
-- 图谱既可以通过 API 读取，也可以直接由静态 viewer 从 artifact JSON 文件读取。
+- 图谱既可以通过 API 读取，也可以直接由静态 viewer 从标准 graph space JSON 文件读取。
+
+## 3.1 当前存储布局
+
+当前实现已经把“文档解析产物”和“标准图谱空间”拆成两层目录：
+
+- `data/artifacts/<document_id>/`
+  - 保留 MinerU 解析结果、`content_list_v2.json`、`full.md`、版面图片等文档级 artifact
+- `data/kg_spaces/<standard_id>/`
+  - 保留 `requirements.json`、`graph_nodes.json`、`graph_edges.json`、`embedding_inputs.jsonl`、`embedding_store.jsonl`、metrics 等标准图谱空间产物
+
+这样做的目的有两个：
+
+- 规范、报告等不同文档类型都可以复用统一的 artifact 落盘约定
+- 每个标准维护一个当前生效的 graph space，便于后续接入报告对比和多规范路由；如果未来需要版本快照，再在标准目录下增加 revisions 层会更清晰
 
 ## 4. 文档处理与标准化设计现状
 
@@ -175,6 +191,7 @@ flowchart LR
 - `batch_max_retries` 控制重试次数
 - `batch_retry_backoff_seconds` 控制退避时间
 - `batch_max_concurrency` 控制并发数
+- embedding 侧也已补上独立的 `max_retries` / `retry_backoff_seconds`，用于应对连接超时、429 和 5xx
 - 最终对 batch 结果按 `batch_index` 排序，避免并发破坏原始处理顺序
 
 ### 6.2 当前度量输出
@@ -246,9 +263,9 @@ flowchart LR
 
 其中：
 
-- `subgraph` 接口当前从本地 `graph_nodes.json / graph_edges.json` 读取
-- `requirement` 详情接口当前从本地 `requirements.json` 读取
-- API 读取层当前以 artifact 物化文件为主，而非数据库优先
+- `subgraph` 接口当前优先从 registry 中记录的 `graphSpaceDir` 读取 `graph_nodes.json / graph_edges.json`
+- `requirement` 详情接口当前优先从 registry 中记录的 `graphSpaceDir` 读取 `requirements.json`
+- API 读取层当前以标准 graph space 物化文件为主，而非数据库优先
 
 ### 8.2 预留未实现接口
 
@@ -263,10 +280,10 @@ flowchart LR
 
 当前仓库已经补上一个与后端解耦的静态图谱前端：
 
-- 默认直接消费 artifact 中的 JSON 文件
+- 默认直接消费标准 graph space 中的 JSON 文件
 - 不依赖 FastAPI API
-- 支持通过 `scripts/serve_graph_viewer.py` 直接预加载某个 artifact
-- 支持在页面中直接选择 `data/artifacts/<artifact_id>` 或 `derived` 目录自动加载
+- 支持通过 `scripts/serve_graph_viewer.py` 直接预加载某个 graph space；传入 artifact 目录时会尝试通过 registry 解析到对应 space
+- 支持在页面中直接选择 `data/kg_spaces/<standard_id>` 自动加载
 - 支持节点详情、结构化属性、关联 requirement、相邻节点展示
 - 图谱区域当前采用局部邻域渲染，避免一次性加载全图造成浏览器压力
 
@@ -327,6 +344,7 @@ flowchart LR
 适合已有 MinerU artifact 的纯建图验证：
 
 - `scripts/run_standard_pipeline.py`
+  - 从 parse artifact 重建 graph space
 
 ### 11.4 图谱展示模式
 
@@ -344,7 +362,7 @@ flowchart LR
 3. embedding 服务稳定性风险
    - 当启用 embedding 但服务未就绪时，流水线会在向量生成阶段失败。
 4. PostgreSQL / pgvector 连接风险
-   - 当配置启用但数据库未就绪时，流水线会在落库阶段受影响。
+   - 当配置启用但 PostgreSQL 服务不可达、凭据错误或账号权限不足时，流水线会在落库阶段受影响；若仅数据库不存在，当前实现会自动创建。
 5. requirement extraction 质量风险
    - 启发式链路能兜底，但不能替代稳定的 LLM 结构化抽取。
 6. comparison / QA 尚未落地

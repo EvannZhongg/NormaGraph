@@ -117,6 +117,10 @@ uv pip install --python .\.venv\Scripts\python.exe -e .
   - 控制 LLM batch 并发数；最终输出仍按原始顺序归并
 - `embedding.enabled`
   - 是否生成 embedding
+- `embedding.max_retries`
+  - 控制单个 embedding batch 的最大重试次数
+- `embedding.retry_backoff_seconds`
+  - 控制 embedding 重试退避时间
 - `postgres.enabled`
   - 是否将图谱和向量写入 PostgreSQL / pgvector；关闭时会保留本地 `embedding_store.jsonl`
 - PostgreSQL 首次启用
@@ -270,6 +274,8 @@ viewer 当前支持两种方式：
 - `graph_node_count`
 - `graph_edge_count`
 - `embedding_generation_status`
+- `embedding_retry_attempt_count`
+- `embedding_retried_batch_count`
 - `postgres_persist_status`
 - `llm_retried_batch_count`
 - `llm_retry_attempt_count`

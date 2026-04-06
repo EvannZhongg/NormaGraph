@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any
 
 import httpx
@@ -11,6 +12,8 @@ from core.config import AppConfig
 
 
 logger = logging.getLogger(__name__)
+
+EMBEDDING_RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
 class ResponseAPIError(RuntimeError):
@@ -149,7 +152,7 @@ class ResponsesAPIClient:
         seen: set[str] = set()
 
         def add(candidate: str) -> None:
-            value = candidate.strip().lstrip("\ufeff")
+            value = candidate.strip().lstrip("﻿")
             if not value or value in seen:
                 return
             seen.add(value)
@@ -201,10 +204,25 @@ class ResponsesAPIClient:
 class EmbeddingsAPIClient:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self.reset_stats()
 
     @property
     def enabled(self) -> bool:
         return self.config.embedding.enabled and bool(self.config.embedding.api_key)
+
+    def reset_stats(self) -> None:
+        self._call_count = 0
+        self._request_attempt_count = 0
+        self._retry_attempt_count = 0
+        self._retried_call_count = 0
+
+    def snapshot_stats(self) -> dict[str, int]:
+        return {
+            'call_count': self._call_count,
+            'request_attempt_count': self._request_attempt_count,
+            'retry_attempt_count': self._retry_attempt_count,
+            'retried_call_count': self._retried_call_count,
+        }
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         if not texts:
@@ -226,13 +244,44 @@ class EmbeddingsAPIClient:
         if self.config.embedding.dimensions:
             payload["dimensions"] = self.config.embedding.dimensions
 
-        try:
-            with httpx.Client(timeout=self.config.embedding.timeout_seconds) as client:
-                response = client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise ResponseAPIError(str(exc)) from exc
+        max_retries = max(0, self.config.embedding.max_retries)
+        self._call_count += 1
+        last_exc: Exception | None = None
+        for attempt in range(max_retries + 1):
+            self._request_attempt_count += 1
+            try:
+                with httpx.Client(timeout=self.config.embedding.timeout_seconds) as client:
+                    response = client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                rows = data.get("data") or []
+                return [row.get("embedding", []) for row in rows]
+            except httpx.HTTPError as exc:
+                last_exc = exc
+                if attempt >= max_retries or not self._is_retryable_embedding_error(exc):
+                    break
+                self._retry_attempt_count += 1
+                if attempt == 0:
+                    self._retried_call_count += 1
+                delay_seconds = self._retry_delay_seconds(attempt + 1)
+                logger.warning(
+                    'Embedding request failed on attempt %s/%s; retrying in %.1fs: %s',
+                    attempt + 1,
+                    max_retries + 1,
+                    delay_seconds,
+                    exc,
+                )
+                time.sleep(delay_seconds)
 
-        data = response.json()
-        rows = data.get("data") or []
-        return [row.get("embedding", []) for row in rows]
+        raise ResponseAPIError(str(last_exc)) from last_exc
+
+    def _retry_delay_seconds(self, attempt_number: int) -> float:
+        base_delay = max(0.0, self.config.embedding.retry_backoff_seconds)
+        return base_delay * attempt_number
+
+    def _is_retryable_embedding_error(self, exc: httpx.HTTPError) -> bool:
+        if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code in EMBEDDING_RETRYABLE_STATUS_CODES
+        return False

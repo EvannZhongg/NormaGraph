@@ -505,6 +505,9 @@ class StandardPipelineService:
         embeddings: dict[str, list[float]] = {}
         batch_size = max(1, self.config.embedding.batch_size)
         batches = [embedding_documents[index : index + batch_size] for index in range(0, len(embedding_documents), batch_size)]
+        metrics['embedding_batch_count'] = len(batches)
+        if hasattr(self.embedding_client, 'reset_stats'):
+            self.embedding_client.reset_stats()
         try:
             for batch in batches:
                 vectors = self.embedding_client.embed_texts([item['text'] for item in batch])
@@ -512,8 +515,18 @@ class StandardPipelineService:
                     embeddings[item['node_uid']] = vector
         except Exception as exc:
             logger.exception('Embedding generation failed')
+            if hasattr(self.embedding_client, 'snapshot_stats'):
+                stats = self.embedding_client.snapshot_stats()
+                metrics['embedding_request_attempt_count'] = stats.get('request_attempt_count', 0)
+                metrics['embedding_retry_attempt_count'] = stats.get('retry_attempt_count', 0)
+                metrics['embedding_retried_batch_count'] = stats.get('retried_call_count', 0)
             metrics['embedding_generation_status'] = f'failed:{exc}'
             return {}
+        if hasattr(self.embedding_client, 'snapshot_stats'):
+            stats = self.embedding_client.snapshot_stats()
+            metrics['embedding_request_attempt_count'] = stats.get('request_attempt_count', 0)
+            metrics['embedding_retry_attempt_count'] = stats.get('retry_attempt_count', 0)
+            metrics['embedding_retried_batch_count'] = stats.get('retried_call_count', 0)
         metrics['embedding_generation_status'] = 'completed'
         metrics['embedding_vector_count'] = len(embeddings)
         return embeddings
@@ -839,6 +852,20 @@ class StandardPipelineService:
         requirements: list[dict[str, Any]],
         extraction_warnings: list[str],
     ) -> str:
+        req_map: dict[str, list[dict[str, Any]]] = {}
+        for requirement in requirements:
+            req_map.setdefault(requirement['parent_clause_uid'], []).append(requirement)
+
+        def clause_heading(clause: dict[str, Any]) -> str:
+            clause_ref = clause.get('clause_ref') or 'n/a'
+            appendix_ref = clause.get('appendix_ref')
+            body_kind = clause.get('body_kind')
+            if body_kind == 'appendix' and appendix_ref:
+                return f'附录{appendix_ref} / {clause_ref}'
+            if body_kind == 'front_matter':
+                return f'前置部分 / {clause_ref}'
+            return clause_ref
+
         lines = [
             f'# Segmentation Report: {standard_uid}',
             '',
@@ -867,30 +894,50 @@ class StandardPipelineService:
                 lines.append(f'- {warning}')
             lines.append('')
 
-        lines.extend(['## Sample Clauses', ''])
-        wanted_refs = {'3.1.1', '3.1.2', '3.1.3', '3.2.1', '3.2.2', '3.4.1', '3.4.10'}
-        sample_clauses = [clause for clause in clauses if clause['body_kind'] == 'main' and clause['clause_ref'] in wanted_refs]
-        if not sample_clauses:
-            sample_clauses = clauses[:8]
-        req_map: dict[str, list[dict[str, Any]]] = {}
-        for requirement in requirements:
-            req_map.setdefault(requirement['parent_clause_uid'], []).append(requirement)
-        for clause in sample_clauses:
+        lines.extend([
+            '## Clause Details',
+            '',
+            f'- Included clauses: {len(clauses)}',
+            f'- Included requirements: {len(requirements)}',
+            '',
+        ])
+        for clause in clauses:
+            clause_requirements = req_map.get(clause['clause_uid'], [])
+            source_page_span = clause.get('source_page_span') or []
+            if len(source_page_span) >= 2:
+                page_text = f'{source_page_span[0]}-{source_page_span[1]}'
+            else:
+                page_text = 'n/a'
             lines.extend([
-                f'### {clause["clause_ref"]}',
+                f'### {clause_heading(clause)}',
                 '',
-                f'- Section: {clause.get("section_ref")}',
-                f'- Pages: {clause["source_page_span"][0]}-{clause["source_page_span"][1]}',
+                f'- Clause UID: {clause["clause_uid"]}',
+                f'- Body kind: {clause.get("body_kind") or "n/a"}',
+                f'- Appendix ref: {clause.get("appendix_ref") or "n/a"}',
+                f'- Chapter: {clause.get("chapter_ref") or "n/a"}',
+                f'- Section: {clause.get("section_ref") or "n/a"}',
+                f'- Pages: {page_text}',
                 f'- Segmentation confidence: {clause["segmentation_confidence"]}',
                 f'- Requirement count: {clause.get("requirement_count", 0)}',
                 f'- Concepts: {", ".join(clause.get("concepts", [])) or "n/a"}',
                 '- Text:',
                 '',
-                clause['source_text_normalized'],
+                clause.get('source_text_normalized') or clause.get('source_text') or '',
+                '',
+                '#### Requirements',
                 '',
             ])
-            for requirement in req_map.get(clause['clause_uid'], [])[:6]:
-                lines.append(f"- {requirement['requirement_uid']}: {requirement['requirement_text']}")
-            if req_map.get(clause['clause_uid']):
-                lines.append('')
+            if clause_requirements:
+                for requirement in clause_requirements:
+                    confidence = requirement.get('confidence')
+                    if isinstance(confidence, (int, float)):
+                        confidence_text = f'{float(confidence):.2f}'
+                    else:
+                        confidence_text = str(confidence) if confidence is not None else 'n/a'
+                    lines.append(
+                        f'- {requirement["requirement_uid"]} | {requirement.get("modality") or "unknown"} | confidence {confidence_text} | {requirement.get("requirement_text") or ""}'
+                    )
+            else:
+                lines.append('- None')
+            lines.append('')
         return '\n'.join(lines).strip() + '\n'

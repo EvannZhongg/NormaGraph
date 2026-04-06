@@ -66,6 +66,8 @@ embedding:
   dimensions: 1024
   timeout_seconds: 120
   batch_size: 10
+  max_retries: 3
+  retry_backoff_seconds: 2.0
   api_key_env: "EMBED_API_KEY"
   target_node_types:
     - "clause"
