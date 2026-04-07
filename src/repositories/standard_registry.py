@@ -30,6 +30,10 @@ class StandardRegistry:
         data = self._read()
         return [StandardSummary.model_validate(item) for item in data.values()]
 
+    def list_details(self) -> list[StandardDetail]:
+        data = self._read()
+        return [StandardDetail.model_validate(item) for item in data.values()]
+
     def get(self, standard_id: str) -> StandardDetail | None:
         item = self._read().get(standard_id)
         if not item:
@@ -46,6 +50,12 @@ class StandardRegistry:
         data = self._read()
         data[detail.standardId] = detail.model_dump(mode="json")
         self._write(data)
+
+    def remove(self, standard_id: str) -> None:
+        data = self._read()
+        if standard_id in data:
+            del data[standard_id]
+            self._write(data)
 
     def detect_from_filename(self, filename: str) -> tuple[str, str, str] | None:
         match = STANDARD_RE.search(filename)

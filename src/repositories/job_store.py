@@ -23,3 +23,17 @@ class JobStore:
         if not path.exists():
             return None
         return IngestionJob.model_validate(json.loads(path.read_text(encoding="utf-8")))
+
+    def list(self) -> list[IngestionJob]:
+        jobs: list[IngestionJob] = []
+        for path in sorted(self.jobs_dir.glob("*.json")):
+            jobs.append(IngestionJob.model_validate(json.loads(path.read_text(encoding="utf-8"))))
+        return jobs
+
+    def list_by_document(self, document_id: str) -> list[IngestionJob]:
+        return [job for job in self.list() if job.documentId == document_id]
+
+    def delete(self, job_id: str) -> None:
+        path = self._job_path(job_id)
+        if path.exists():
+            path.unlink()

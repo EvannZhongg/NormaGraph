@@ -25,6 +25,7 @@ class StorageConfig(BaseModel):
     jobs_dir: str = "data/jobs"
     artifacts_dir: str = "data/artifacts"
     downloads_dir: str = "data/downloads"
+    uploads_dir: str = "data/uploads"
     kg_spaces_dir: str = "data/kg_spaces"
     registry_path: str = "data/registry/standards.json"
 
@@ -140,6 +141,10 @@ class AppConfig(BaseModel):
         return self.root_dir / self.storage.downloads_dir
 
     @property
+    def uploads_dir(self) -> Path:
+        return self.root_dir / self.storage.uploads_dir
+
+    @property
     def kg_spaces_dir(self) -> Path:
         return self.root_dir / self.storage.kg_spaces_dir
 
@@ -155,11 +160,20 @@ class AppConfig(BaseModel):
     def schema_dir(self) -> Path:
         return self.resource_dir / "schemas"
 
+    @property
+    def webui_dir(self) -> Path:
+        return self.root_dir / "webui"
+
     def artifact_dir_for(self, document_id: str) -> Path:
         return self.artifacts_dir / self._safe_storage_segment(document_id)
 
     def download_work_dir_for(self, document_id: str, job_id: str) -> Path:
         return self.downloads_dir / self._safe_storage_segment(document_id) / self._safe_storage_segment(job_id)
+
+    def upload_path_for(self, filename: str) -> Path:
+        safe_name = self._safe_storage_segment(Path(filename).stem)
+        suffix = Path(filename).suffix.lower() or ".bin"
+        return self.uploads_dir / f"{safe_name}-{os.urandom(4).hex()}{suffix}"
 
     def kg_space_dir_for(self, standard_id: str) -> Path:
         return self.kg_spaces_dir / self._safe_storage_segment(standard_id)
@@ -214,6 +228,7 @@ def get_config() -> AppConfig:
         config.jobs_dir,
         config.artifacts_dir,
         config.downloads_dir,
+        config.uploads_dir,
         config.kg_spaces_dir,
         config.registry_path.parent,
         config.schema_dir,

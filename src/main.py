@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, RedirectResponse
 
 from adapters.mineru_client import MinerUClient
 from api.routes import build_router
@@ -12,6 +15,26 @@ from repositories.standard_registry import StandardRegistry
 from services.ingestion_service import IngestionService
 from services.normalization import NormalizationService
 from services.standard_pipeline import StandardPipelineService
+
+
+def _configure_webui_routes(app: FastAPI, webui_dir: Path) -> None:
+    index_path = webui_dir / "index.html"
+
+    @app.get("/", include_in_schema=False)
+    async def root_redirect() -> RedirectResponse:
+        return RedirectResponse(url="/webui/", status_code=307)
+
+    @app.get("/webui", include_in_schema=False)
+    @app.get("/webui/", include_in_schema=False)
+    @app.get("/webui/{full_path:path}", include_in_schema=False)
+    async def serve_webui(full_path: str = "") -> FileResponse:
+        if full_path:
+            requested = (webui_dir / full_path).resolve()
+            if requested.exists() and requested.is_file() and requested.is_relative_to(webui_dir.resolve()):
+                return FileResponse(requested)
+        if not index_path.exists():
+            raise HTTPException(status_code=404, detail="Web UI build output was not found. Build the frontend into /webui first.")
+        return FileResponse(index_path)
 
 
 def create_app() -> FastAPI:
@@ -31,12 +54,10 @@ def create_app() -> FastAPI:
         standard_pipeline_service=standard_pipeline_service,
     )
 
-    app = FastAPI(title="Dam Safety KG Agent API", version="0.1.0")
+    app = FastAPI(title="Dam Safety KG Agent API", version="0.2.0")
     app.include_router(build_router(ingestion_service))
+    _configure_webui_routes(app, config.webui_dir)
     return app
-
-
-app = create_app()
 
 
 def main() -> None:
@@ -47,6 +68,9 @@ def main() -> None:
         port=config.server.port,
         reload=config.server.reload,
     )
+
+
+app = create_app()
 
 
 if __name__ == "__main__":
