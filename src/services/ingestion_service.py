@@ -9,7 +9,7 @@ import re
 import shutil
 import uuid
 import zipfile
-from typing import Any
+from typing import Any, Sequence
 
 import httpx
 from fastapi import BackgroundTasks
@@ -42,7 +42,7 @@ KG_SPACE_DIR_RE = re.compile(r"^(?P<prefix>[a-z]+\d+)-(?P<year>\d{2,4})$", re.IG
 GRAPH_WORKBENCH_DEFAULT_DEPTH = 2
 GRAPH_WORKBENCH_MAX_DEPTH = 4
 GRAPH_WORKBENCH_DEFAULT_NODES = 220
-GRAPH_WORKBENCH_MAX_NODES = 420
+GRAPH_WORKBENCH_MAX_NODES = 3000
 
 
 class IngestionService:
@@ -478,11 +478,13 @@ class IngestionService:
         *,
         label: str | None = None,
         node_id: str | None = None,
+        preferred_node_types: Sequence[str] | None = None,
         max_depth: int = GRAPH_WORKBENCH_DEFAULT_DEPTH,
         max_nodes: int = GRAPH_WORKBENCH_DEFAULT_NODES,
     ) -> dict[str, Any]:
         max_depth = max(1, min(max_depth, GRAPH_WORKBENCH_MAX_DEPTH))
-        max_nodes = max(1, min(max_nodes, GRAPH_WORKBENCH_MAX_NODES))
+        unbounded_nodes = max_nodes <= 0
+        max_nodes = 0 if unbounded_nodes else max(1, min(max_nodes, GRAPH_WORKBENCH_MAX_NODES))
         nodes, edges, _ = self._load_graph_records(standard_id)
         if not nodes:
             return {
@@ -496,6 +498,10 @@ class IngestionService:
             }
 
         node_map = {str(node.get("node_uid")): node for node in nodes if node.get("node_uid")}
+        node_type_index = {
+            node_key: self._normalize_graph_query(str(node.get("node_type") or ""))
+            for node_key, node in node_map.items()
+        }
         adjacency: dict[str, list[str]] = defaultdict(list)
         for edge in edges:
             source_uid = str(edge.get("source_uid") or "")
@@ -505,6 +511,11 @@ class IngestionService:
                 adjacency[target_uid].append(source_uid)
 
         degrees = self._build_degree_map(nodes, edges)
+        preferred_type_set: set[str] = set()
+        for raw_type in preferred_node_types or []:
+            normalized_type = self._normalize_graph_query(raw_type)
+            if normalized_type:
+                preferred_type_set.add(normalized_type)
         start_node = self._resolve_graph_start_node(nodes, degrees, standard_id, label, node_id)
         if start_node is None:
             raise FileNotFoundError(f"Starting node for {standard_id} was not found.")
@@ -513,7 +524,6 @@ class IngestionService:
         visited: set[str] = {start_node_id}
         ordered: list[str] = [start_node_id]
         queue: deque[tuple[str, int]] = deque([(start_node_id, 0)])
-        is_truncated = False
 
         while queue:
             current_node_id, depth = queue.popleft()
@@ -523,6 +533,7 @@ class IngestionService:
             neighbors = sorted(
                 adjacency.get(current_node_id, []),
                 key=lambda candidate_id: (
+                    0 if node_type_index.get(candidate_id, "") in preferred_type_set else 1,
                     -degrees.get(candidate_id, 0),
                     self._graph_node_label(node_map[candidate_id]).lower(),
                     candidate_id,
@@ -531,12 +542,29 @@ class IngestionService:
             for neighbor_id in neighbors:
                 if neighbor_id in visited:
                     continue
-                if len(visited) >= max_nodes:
-                    is_truncated = True
-                    continue
                 visited.add(neighbor_id)
                 ordered.append(neighbor_id)
                 queue.append((neighbor_id, depth + 1))
+
+        is_truncated = False
+        if not unbounded_nodes and len(ordered) > max_nodes:
+            is_truncated = True
+            remaining_slots = max(0, max_nodes - 1)
+            prioritized_ids = [
+                node_key
+                for node_key in ordered[1:]
+                if node_type_index.get(node_key, "") in preferred_type_set
+            ]
+            fallback_ids = [
+                node_key
+                for node_key in ordered[1:]
+                if node_type_index.get(node_key, "") not in preferred_type_set
+            ]
+            ordered = [start_node_id]
+            ordered.extend(prioritized_ids[:remaining_slots])
+            if len(ordered) < max_nodes:
+                ordered.extend(fallback_ids[: max_nodes - len(ordered)])
+            visited = set(ordered)
 
         workbench_nodes = [self._serialize_workbench_node(node_map[node_key], degrees.get(node_key, 0)) for node_key in ordered if node_key in node_map]
         workbench_edges = [

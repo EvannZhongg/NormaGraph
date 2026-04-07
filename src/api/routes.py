@@ -61,8 +61,9 @@ def build_router(ingestion_service: IngestionService) -> APIRouter:
         standard_id: str = Query(...),
         label: str | None = Query(default=None),
         node_id: str | None = Query(default=None),
+        preferred_node_types: str | None = Query(default=None),
         max_depth: int = Query(default=2, ge=1, le=4),
-        max_nodes: int = Query(default=220, ge=1, le=420),
+        max_nodes: int = Query(default=220, ge=0, le=3000),
     ) -> GraphWorkbenchResponse:
         try:
             return GraphWorkbenchResponse(
@@ -70,6 +71,7 @@ def build_router(ingestion_service: IngestionService) -> APIRouter:
                     standard_id,
                     label=label,
                     node_id=node_id,
+                    preferred_node_types=_parse_csv_values(preferred_node_types),
                     max_depth=max_depth,
                     max_nodes=max_nodes,
                 )
@@ -295,6 +297,12 @@ def build_router(ingestion_service: IngestionService) -> APIRouter:
         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=f"Comparison items for {comparison_id} are not implemented yet.")
 
     return router
+
+
+def _parse_csv_values(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 def _parse_command_options(command: str | None) -> dict[str, str]:
