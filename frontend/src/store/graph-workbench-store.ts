@@ -12,6 +12,7 @@ interface GraphWorkbenchState {
   showStatusPanel: boolean
   inspectorCollapsed: boolean
   showEdgeLabels: boolean
+  showNodeLabels: boolean
   muteNonSelectedEdges: boolean
   labelSizeThreshold: number
   rawGraph: GraphWorkbenchData | null
@@ -32,6 +33,7 @@ interface GraphWorkbenchState {
   setShowStatusPanel: (value: boolean) => void
   setInspectorCollapsed: (value: boolean) => void
   setShowEdgeLabels: (value: boolean) => void
+  setShowNodeLabels: (value: boolean) => void
   setMuteNonSelectedEdges: (value: boolean) => void
   setLabelSizeThreshold: (value: number) => void
   setGraphData: (rawGraph: GraphWorkbenchData | null, runtimeGraph: RuntimeGraph | null) => void
@@ -58,6 +60,7 @@ export const useGraphWorkbenchStore = create<GraphWorkbenchState>()(
       showStatusPanel: false,
       inspectorCollapsed: true,
       showEdgeLabels: false,
+      showNodeLabels: true,
       muteNonSelectedEdges: true,
       labelSizeThreshold: 8,
       rawGraph: null,
@@ -78,6 +81,7 @@ export const useGraphWorkbenchStore = create<GraphWorkbenchState>()(
       setShowStatusPanel: (showStatusPanel) => set({ showStatusPanel }),
       setInspectorCollapsed: (inspectorCollapsed) => set({ inspectorCollapsed }),
       setShowEdgeLabels: (showEdgeLabels) => set({ showEdgeLabels }),
+      setShowNodeLabels: (showNodeLabels) => set({ showNodeLabels }),
       setMuteNonSelectedEdges: (muteNonSelectedEdges) => set({ muteNonSelectedEdges }),
       setLabelSizeThreshold: (labelSizeThreshold) => set({ labelSizeThreshold }),
       setGraphData: (rawGraph, runtimeGraph) =>
@@ -124,6 +128,7 @@ export const useGraphWorkbenchStore = create<GraphWorkbenchState>()(
         showStatusPanel: state.showStatusPanel,
         inspectorCollapsed: state.inspectorCollapsed,
         showEdgeLabels: state.showEdgeLabels,
+        showNodeLabels: state.showNodeLabels,
         muteNonSelectedEdges: state.muteNonSelectedEdges,
         labelSizeThreshold: state.labelSizeThreshold,
       }),

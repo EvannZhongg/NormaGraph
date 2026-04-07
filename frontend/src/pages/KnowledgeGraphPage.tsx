@@ -43,7 +43,8 @@ import { useGraphWorkbenchStore } from '../store/graph-workbench-store'
 
 const LAYOUT_OPTIONS: GraphLayoutMode[] = ['circular', 'circlepack', 'random', 'noverlap', 'force-directed', 'force-atlas']
 const MAX_DEPTH_OPTIONS = [1, 2, 3, 4]
-const MAX_NODE_OPTIONS = [120, 180, 220, 300, 420]
+const ALL_MAX_NODES_VALUE = 0
+const MAX_NODE_OPTIONS = [120, 180, 220, 300, 420, 600, 800, 1200, 1600, 2200, 3000, ALL_MAX_NODES_VALUE]
 
 interface InspectorRelationItem {
   edgeId: string
@@ -87,6 +88,7 @@ export function KnowledgeGraphPage() {
   const showStatusPanel = useGraphWorkbenchStore((state) => state.showStatusPanel)
   const inspectorCollapsed = useGraphWorkbenchStore((state) => state.inspectorCollapsed)
   const showEdgeLabels = useGraphWorkbenchStore((state) => state.showEdgeLabels)
+  const showNodeLabels = useGraphWorkbenchStore((state) => state.showNodeLabels)
   const muteNonSelectedEdges = useGraphWorkbenchStore((state) => state.muteNonSelectedEdges)
   const labelSizeThreshold = useGraphWorkbenchStore((state) => state.labelSizeThreshold)
   const rawGraph = useGraphWorkbenchStore((state) => state.rawGraph)
@@ -108,6 +110,7 @@ export function KnowledgeGraphPage() {
   const setShowStatusPanel = useGraphWorkbenchStore((state) => state.setShowStatusPanel)
   const setInspectorCollapsed = useGraphWorkbenchStore((state) => state.setInspectorCollapsed)
   const setShowEdgeLabels = useGraphWorkbenchStore((state) => state.setShowEdgeLabels)
+  const setShowNodeLabels = useGraphWorkbenchStore((state) => state.setShowNodeLabels)
   const setMuteNonSelectedEdges = useGraphWorkbenchStore((state) => state.setMuteNonSelectedEdges)
   const setLabelSizeThreshold = useGraphWorkbenchStore((state) => state.setLabelSizeThreshold)
   const setGraphData = useGraphWorkbenchStore((state) => state.setGraphData)
@@ -234,15 +237,24 @@ export function KnowledgeGraphPage() {
   }, [canvasSearchResults, rawGraph, selectedEdgeId, selectedNodeId])
 
   const nodeLegend = useMemo(() => {
+    if (selectedSpace) {
+      return buildDistributionFromCounts(selectedSpace.nodeTypes ?? {}).map(([name, count]) => ({
+        name,
+        count,
+        color: resolveNodePalette(name).color,
+      }))
+    }
+
     if (!rawGraph) {
       return [] as Array<{ name: string; count: number; color: string }>
     }
+
     return buildDistribution(rawGraph.nodes.map((node) => node.nodeType)).map(([name, count]) => ({
       name,
       count,
       color: resolveNodePalette(name).color,
     }))
-  }, [rawGraph])
+  }, [rawGraph, selectedSpace])
 
   useEffect(() => {
     if (selectedNodeId && hiddenNodeIds.has(selectedNodeId)) {
@@ -257,6 +269,10 @@ export function KnowledgeGraphPage() {
       }
     }
   }, [clearSelection, edgeMap, hiddenNodeIds, selectedEdgeId, selectedNodeId])
+
+  const hiddenNodeTypeMessage = hiddenNodeTypes.length === 0
+    ? '默认全部显示，点击类型可隐藏该类节点。'
+    : `当前已隐藏 ${hiddenNodeTypes.length} 类节点，点击灰色类型可恢复显示。`
 
   const edgeLegend = useMemo(() => {
     if (!rawGraph) {
@@ -446,6 +462,7 @@ export function KnowledgeGraphPage() {
       const renderer = new Sigma(runtimeGraph, canvasRef.current, createSigmaSettings({
         labelSizeThreshold,
         showEdgeLabels,
+        showNodeLabels,
         selectionContext,
         muteNonSelectedEdges,
         hiddenNodeIds,
@@ -460,13 +477,14 @@ export function KnowledgeGraphPage() {
       createSigmaSettings({
         labelSizeThreshold,
         showEdgeLabels,
+        showNodeLabels,
         selectionContext,
         muteNonSelectedEdges,
         hiddenNodeIds,
       }),
     )
     sigmaRef.current.refresh()
-  }, [hiddenNodeIds, labelSizeThreshold, muteNonSelectedEdges, runtimeGraph, selectionContext, showEdgeLabels])
+  }, [hiddenNodeIds, labelSizeThreshold, muteNonSelectedEdges, runtimeGraph, selectionContext, showEdgeLabels, showNodeLabels])
 
   useEffect(() => {
     const renderer = sigmaRef.current
@@ -478,13 +496,14 @@ export function KnowledgeGraphPage() {
       createSigmaSettings({
         labelSizeThreshold,
         showEdgeLabels,
+        showNodeLabels,
         selectionContext,
         muteNonSelectedEdges,
         hiddenNodeIds,
       }),
     )
     renderer.refresh()
-  }, [hiddenNodeIds, labelSizeThreshold, muteNonSelectedEdges, selectionContext, showEdgeLabels])
+  }, [hiddenNodeIds, labelSizeThreshold, muteNonSelectedEdges, selectionContext, showEdgeLabels, showNodeLabels])
 
   useEffect(() => {
     if (!runtimeGraph || !sigmaRef.current) {
@@ -708,7 +727,7 @@ export function KnowledgeGraphPage() {
       const incoming = await loadWorkbenchGraph({
         standardId: selectedStandardId,
         nodeId,
-        maxDepth,
+          maxDepth,
         maxNodes,
       })
       const nextRaw = {
@@ -1173,20 +1192,21 @@ export function KnowledgeGraphPage() {
                       <span className="workbench-field-label">Max Nodes</span>
                       <select value={maxNodes} onChange={(event) => setMaxNodes(Number(event.target.value))} className="workbench-select">
                         {MAX_NODE_OPTIONS.map((value) => (
-                          <option key={value} value={value}>{value}</option>
+                          <option key={value} value={value}>{formatMaxNodesValue(value)}</option>
                         ))}
                       </select>
                     </label>
                   </div>
 
                   <div className="workbench-toggle-list">
+                    <ToggleButton label="Node Labels" active={showNodeLabels} onClick={() => setShowNodeLabels(!showNodeLabels)} />
                     <ToggleButton label="Edge Labels" active={showEdgeLabels} onClick={() => setShowEdgeLabels(!showEdgeLabels)} />
                     <ToggleButton label="弱化非选中边" active={muteNonSelectedEdges} onClick={() => setMuteNonSelectedEdges(!muteNonSelectedEdges)} />
                   </div>
 
                   <label className="workbench-field">
                     <span className="workbench-field-label">标签阈值 {labelSizeThreshold.toFixed(0)}</span>
-                    <input type="range" min={4} max={18} step={1} value={labelSizeThreshold} onChange={(event) => setLabelSizeThreshold(Number(event.target.value))} className="workbench-range" />
+                    <input type="range" min={4} max={18} step={1} value={labelSizeThreshold} onChange={(event) => setLabelSizeThreshold(Number(event.target.value))} className="workbench-range" disabled={!showNodeLabels} />
                   </label>
 
                   {truncatedMessage ? <div className="workbench-inline-notice">{truncatedMessage}</div> : null}
@@ -1235,18 +1255,22 @@ export function KnowledgeGraphPage() {
           <div className={clsx('workbench-legend-stack', inspectorCollapsed && 'is-free')}>
             <div className="workbench-legend-float-section">
               <p className="workbench-legend-caption">Node Types</p>
+              <div className="workbench-legend-empty">{hiddenNodeTypeMessage}</div>
               {nodeLegend.length === 0 ? <div className="workbench-legend-empty">暂无节点类型</div> : null}
-              {nodeLegend.map((item) => (
-                <LegendBeaconRow
-                  key={`node-${item.name}`}
-                  label={item.name}
-                  count={item.count}
-                  color={item.color}
-                  muted={hiddenNodeTypeSet.has(normalizeText(item.name))}
-                  onClick={() => handleToggleNodeTypeVisibility(item.name)}
-                  title={hiddenNodeTypeSet.has(normalizeText(item.name)) ? '点击恢复该实体类型' : '点击隐藏该实体类型'}
-                />
-              ))}
+              {nodeLegend.map((item) => {
+                const isHidden = hiddenNodeTypeSet.has(normalizeText(item.name))
+                return (
+                  <LegendBeaconRow
+                    key={`node-${item.name}`}
+                    label={item.name}
+                    count={item.count}
+                    color={item.color}
+                    muted={isHidden}
+                    onClick={() => handleToggleNodeTypeVisibility(item.name)}
+                    title={isHidden ? '点击恢复该实体类型' : '点击隐藏该实体类型'}
+                  />
+                )
+              })}
             </div>
 
             <div className="workbench-legend-float-section">
@@ -1450,6 +1474,7 @@ export function KnowledgeGraphPage() {
 function createSigmaSettings(options: {
   labelSizeThreshold: number
   showEdgeLabels: boolean
+  showNodeLabels: boolean
   selectionContext: {
     connectedNodeIds: Set<string>
     connectedEdgeIds: Set<string>
@@ -1458,7 +1483,7 @@ function createSigmaSettings(options: {
   muteNonSelectedEdges: boolean
   hiddenNodeIds: Set<string>
 }) {
-  const { labelSizeThreshold, showEdgeLabels, selectionContext, muteNonSelectedEdges, hiddenNodeIds } = options
+  const { labelSizeThreshold, showEdgeLabels, showNodeLabels, selectionContext, muteNonSelectedEdges, hiddenNodeIds } = options
 
   return {
     allowInvalidContainer: true,
@@ -1467,30 +1492,34 @@ function createSigmaSettings(options: {
     enableEdgeEvents: true,
     hideLabelsOnMove: true,
     labelDensity: 0.85,
-    labelRenderedSizeThreshold: labelSizeThreshold,
+    labelRenderedSizeThreshold: showNodeLabels ? labelSizeThreshold : Number.MAX_SAFE_INTEGER,
     labelFont: 'IBM Plex Sans',
     edgeLabelFont: 'IBM Plex Mono',
     renderEdgeLabels: showEdgeLabels,
     zIndex: true,
     nodeReducer: (node: string, data: Record<string, unknown>) => {
       if (hiddenNodeIds.has(node)) {
-        return { ...data, hidden: true, forceLabel: false, highlighted: false }
+        return { ...data, hidden: true, label: showNodeLabels ? data.label : '', forceLabel: false, highlighted: false }
       }
 
       const isSelected = selectionContext.connectedNodeIds.has(node)
       const isSearchHit = selectionContext.searchMatches.has(node)
       const selectedNodeId = useGraphWorkbenchStore.getState().selectedNodeId
-      const next: Record<string, unknown> = { hidden: false }
+      const next: Record<string, unknown> = { hidden: false, label: showNodeLabels ? data.label : '', forceLabel: false }
 
       if (isSelected) {
-        next.forceLabel = true
+        if (showNodeLabels) {
+          next.forceLabel = true
+        }
         next.zIndex = node === selectedNodeId ? 9 : 6
         next.highlighted = true
         next.size = typeof data.size === 'number' ? data.size * (node === selectedNodeId ? 1.22 : 1.08) : data.size
       }
 
       if (isSearchHit) {
-        next.forceLabel = true
+        if (showNodeLabels) {
+          next.forceLabel = true
+        }
         next.highlighted = true
         next.zIndex = Math.max(Number(next.zIndex ?? data.zIndex ?? 1), 8)
         next.size = typeof data.size === 'number' ? Math.max(data.size * 1.12, Number(next.size ?? 0)) : next.size
@@ -1557,6 +1586,7 @@ function LegendBeaconRow({
   label,
   count,
   color,
+  active = false,
   muted = false,
   onClick,
   title,
@@ -1564,20 +1594,22 @@ function LegendBeaconRow({
   label: string
   count: number
   color: string
+  active?: boolean
   muted?: boolean
   onClick?: () => void
   title?: string
 }) {
   const className = clsx(
     'workbench-legend-float-row',
+    active && 'is-active',
     muted && 'is-muted',
     onClick && 'is-interactive',
   )
 
   if (onClick) {
     return (
-      <button type="button" className={className} onClick={onClick} aria-pressed={muted} title={title}>
-        <span className="workbench-legend-beacon" style={{ '--legend-color': color } as React.CSSProperties} />
+      <button type="button" className={className} onClick={onClick} aria-pressed={active} title={title} style={{ '--legend-color': color } as React.CSSProperties}>
+        <span className="workbench-legend-beacon" />
         <span>{label}</span>
         <strong>{count}</strong>
       </button>
@@ -1585,8 +1617,8 @@ function LegendBeaconRow({
   }
 
   return (
-    <div className={className} title={title}>
-      <span className="workbench-legend-beacon" style={{ '--legend-color': color } as React.CSSProperties} />
+    <div className={className} title={title} style={{ '--legend-color': color } as React.CSSProperties}>
+      <span className="workbench-legend-beacon" />
       <span>{label}</span>
       <strong>{count}</strong>
     </div>
@@ -1898,6 +1930,14 @@ function buildDistribution(values: string[]) {
   const counts = new Map<string, number>()
   values.forEach((value) => counts.set(value, (counts.get(value) ?? 0) + 1))
   return [...counts.entries()].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], 'zh-CN'))
+}
+
+function buildDistributionFromCounts(values: Record<string, number>) {
+  return Object.entries(values).sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], 'zh-CN'))
+}
+
+function formatMaxNodesValue(value: number) {
+  return value === ALL_MAX_NODES_VALUE ? 'All' : String(value)
 }
 
 function resolveNodeText(node: GraphWorkbenchNode) {

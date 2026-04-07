@@ -261,6 +261,7 @@ export async function loadWorkbenchGraph(params: {
   standardId: string
   label?: string | null
   nodeId?: string | null
+  preferredNodeTypes?: string[]
   maxDepth?: number
   maxNodes?: number
 }) {
@@ -269,6 +270,7 @@ export async function loadWorkbenchGraph(params: {
       standard_id: params.standardId,
       label: params.label || undefined,
       node_id: params.nodeId || undefined,
+      preferred_node_types: params.preferredNodeTypes?.length ? params.preferredNodeTypes.join(',') : undefined,
       max_depth: params.maxDepth,
       max_nodes: params.maxNodes,
     },

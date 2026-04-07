@@ -1559,6 +1559,22 @@
     transform: translateY(-1px);
   }
 
+  .workbench-legend-float-row.is-active {
+    color: var(--text-primary);
+    border-color: color-mix(in srgb, var(--legend-color, var(--line-strong)) 48%, white 52%);
+    background: color-mix(in srgb, var(--legend-color, var(--panel-elevated)) 12%, white 88%);
+    box-shadow: 0 14px 24px color-mix(in srgb, var(--legend-color, rgba(15, 23, 42, 0.08)) 18%, transparent);
+  }
+
+  .workbench-legend-float-row.is-active strong {
+    color: var(--text-primary);
+  }
+
+  .workbench-legend-float-row.is-active .workbench-legend-beacon {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--legend-color) 26%, transparent);
+    transform: scale(1.08);
+  }
+
   .workbench-legend-float-row.is-muted {
     color: var(--text-dim);
     background: color-mix(in srgb, var(--bg-soft) 88%, transparent);
