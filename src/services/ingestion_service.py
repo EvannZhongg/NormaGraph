@@ -32,6 +32,7 @@ from models.schemas import (
 from repositories.job_store import JobStore
 from repositories.standard_registry import StandardRegistry
 from services.normalization import NormalizationService
+from services.report_pipeline import ReportPipelineService
 from services.standard_pipeline import StandardPipelineService
 
 
@@ -54,6 +55,7 @@ class IngestionService:
         mineru_client: MinerUClient,
         normalization_service: NormalizationService,
         standard_pipeline_service: StandardPipelineService,
+        report_pipeline_service: ReportPipelineService,
     ) -> None:
         self.config = config
         self.job_store = job_store
@@ -61,6 +63,7 @@ class IngestionService:
         self.mineru_client = mineru_client
         self.normalization_service = normalization_service
         self.standard_pipeline_service = standard_pipeline_service
+        self.report_pipeline_service = report_pipeline_service
 
     def create_job(self, request: CreateIngestionJobRequest, background_tasks: BackgroundTasks) -> IngestionJob:
         source_path = self._resolve_source_path(request.sourcePath)
@@ -209,6 +212,16 @@ class IngestionService:
         detail = self.registry.find_by_document_id(document_id)
         jobs = self.list_document_jobs(document_id)
         deleted = bool(detail or jobs)
+
+        for job in jobs:
+            if job.documentType != "report":
+                continue
+            report_space_dir = (
+                job.result.get("report_space_dir")
+                or ((job.result.get("report_space") or {}).get("dir") if isinstance(job.result.get("report_space"), dict) else None)
+            )
+            if isinstance(report_space_dir, str) and report_space_dir:
+                self._safe_remove_tree(report_space_dir, self.config.report_spaces_dir)
 
         for job in jobs:
             self.job_store.delete(job.jobId)
@@ -963,6 +976,7 @@ class IngestionService:
             },
         }
         return response, merged_nodes, merged_edges
+
     async def _run_job(self, job_id: str, request: CreateIngestionJobRequest) -> None:
         job = self._require_job(job_id)
         source_path = self._resolve_source_path(request.sourcePath)
@@ -976,8 +990,11 @@ class IngestionService:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         detected_standard = self._resolve_standard_descriptor(request, source_path) if request.documentType == "standard" else None
         graph_space_dir = self.config.kg_space_dir_for(detected_standard[0]) if detected_standard else None
+        report_space_dir = self.config.report_space_dir_for(job.documentId) if request.documentType == "report" else None
         if graph_space_dir is not None:
             job.result["graph_space_dir"] = str(graph_space_dir)
+        if report_space_dir is not None:
+            job.result["report_space_dir"] = str(report_space_dir)
 
         try:
             normalization = self.normalization_service.normalize(source_path, request, work_dir)
@@ -1029,6 +1046,10 @@ class IngestionService:
                 job.progress = 0.88
                 self._touch(job)
                 self._build_standard_graph(job, source_path, artifact_dir, detected_standard, graph_space_dir)
+            elif request.buildGraph and request.documentType == "report":
+                job.progress = 0.88
+                self._touch(job)
+                self._build_report_space(job, source_path, artifact_dir, report_space_dir)
 
             if detected_standard and not request.buildGraph:
                 self._upsert_standard_detail(
@@ -1102,6 +1123,36 @@ class IngestionService:
             "ready",
             graph_space_dir=graph_space_dir,
         )
+
+    def _build_report_space(
+        self,
+        job: IngestionJob,
+        source_path: Path,
+        artifact_dir: Path,
+        report_space_dir: Path | None,
+    ) -> None:
+        if report_space_dir is None:
+            raise FileNotFoundError("Report space directory could not be resolved.")
+
+        output = self.report_pipeline_service.run(artifact_dir, job.documentId)
+        files = self.report_pipeline_service.write_outputs(
+            report_space_dir,
+            output,
+            artifact_dir=artifact_dir,
+            document_id=job.documentId,
+            source_path=source_path,
+        )
+        job.result["report"] = {
+            "document_id": job.documentId,
+            "report_space_dir": str(report_space_dir),
+            "metrics": output.metrics,
+            "files": {key: str(path) for key, path in files.items()},
+        }
+        job.result["report_space"] = {
+            "dir": str(report_space_dir),
+            "files": self._artifact_index(report_space_dir),
+        }
+        job.result["artifacts"] = self._artifact_index(artifact_dir)
 
     async def _poll_for_result(self, job: IngestionJob, batch_id: str, file_name: str) -> dict:
         deadline = asyncio.get_running_loop().time() + self.config.mineru.poll_timeout_seconds

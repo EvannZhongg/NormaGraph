@@ -14,6 +14,7 @@ from repositories.job_store import JobStore
 from repositories.standard_registry import StandardRegistry
 from services.ingestion_service import IngestionService
 from services.normalization import NormalizationService
+from services.report_pipeline import ReportPipelineService
 from services.standard_pipeline import StandardPipelineService
 
 
@@ -45,6 +46,7 @@ def create_app() -> FastAPI:
     mineru_client = MinerUClient(config)
     normalization_service = NormalizationService(config)
     standard_pipeline_service = StandardPipelineService(config=config)
+    report_pipeline_service = ReportPipelineService(config=config)
     ingestion_service = IngestionService(
         config=config,
         job_store=job_store,
@@ -52,6 +54,7 @@ def create_app() -> FastAPI:
         mineru_client=mineru_client,
         normalization_service=normalization_service,
         standard_pipeline_service=standard_pipeline_service,
+        report_pipeline_service=report_pipeline_service,
     )
 
     app = FastAPI(title="Dam Safety KG Agent API", version="0.2.0")
