@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StandardTitleClassificationBatch",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "title_id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string",
+            "enum": [
+              "clause",
+              "section",
+              "reference_standard",
+              "chapter",
+              "appendix",
+              "none"
+            ]
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "rationale": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title_id",
+          "label",
+          "confidence",
+          "rationale"
+        ]
+      }
+    }
+  },
+  "required": [
+    "items"
+  ]
+}

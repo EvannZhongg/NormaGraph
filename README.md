@@ -22,6 +22,7 @@
 - 文档解析 artifact 固定保留在 `data/artifacts/<document_id>/`
 - 标准图谱派生产物保留在 `data/kg_spaces/<standard_id>/`
 - 完成 `content_list_v2.json -> 结构归一化 -> 条文切分 -> requirement extraction`
+- 标准主链路中的 `title` 识别在 `llm.enabled=true` 时走 LLM 判别，标签包括 `chapter / section / reference_standard / appendix / clause / none`
 - 支持 `heuristic / llm / hybrid` 三种抽取模式
 - 支持 embedding 本地输出与 PostgreSQL / pgvector 可选落库
 - 提供 Documents / Knowledge Graph / Retrieval / API 四个前端工作区
@@ -51,6 +52,8 @@
   - 文档标准化与本地预处理识别
 - `src/services/standard_pipeline.py`
   - 规范建图主流水线
+- `src/services/standard_title_classification.py`
+  - 规范 `title` 的 LLM 判别服务
 - `src/services/ingestion_service.py`
   - ingestion 任务调度、文档列表、kg space 查询与图谱编辑
 - `src/repositories/job_store.py`
@@ -174,6 +177,8 @@ normagraph-server
 
 - `knowledge_graph.extraction_mode`
   - 可选 `heuristic / llm / hybrid`
+- `llm.enabled`
+  - 控制主链路中的 LLM 能力开关；对标准文档来说，开启后会先用 LLM 判断 `title` 是否属于 `chapter / section / reference_standard / appendix / clause / none`
 - `knowledge_graph.fallback_to_heuristic_on_llm_error`
   - LLM 失败时是否自动回退到启发式抽取
 - `embedding.enabled`
@@ -270,6 +275,14 @@ normagraph-server
 - `segmentation_metrics.json`
 - `segmentation_report.md`
 
+其中与标题识别直接相关的字段包括：
+
+- `segmentation_metrics.json -> title_classification_mode`
+  - `heuristic` 表示标题仍按规则识别
+  - `llm` 表示标题已按 LLM 判别进入主链路
+- `segmentation_metrics.json -> title_classifier_*`
+  - 记录标题判别请求数、批次数、成功数与标签分布
+
 ## 当前已实现接口
 
 基础接口：
@@ -313,6 +326,7 @@ Knowledge Graph：
 
 - MinerU 批任务创建成功后，仍可能在 OSS 上传阶段受本地网络环境影响
 - 某些 OpenAI 兼容端点对 `/responses` 的支持并不完整，可能导致结构化输出漂移、超时或回退到启发式抽取
+- 当 `llm.enabled=true` 时，标准文档的标题识别也会依赖同一个 `/responses` 兼容端点；如果兼容端点返回 shape 不稳定，标题判别阶段会直接报错，不会静默退回规则
 - 当 `embedding.enabled=true` 且 embedding 服务未就绪时，embedding 生成阶段会失败或超时
 - 当 `postgres.enabled=true` 且 PostgreSQL 服务不可达、凭据错误或当前账号没有建库/建表权限时，建图流程会在落库阶段报错
 - Retrieval / Comparison 后端尚未实现，前端页面当前为工作台占位和参数面板
@@ -324,3 +338,6 @@ Knowledge Graph：
 - 排查解析或网络问题时，优先用 `scripts/test_ingestion_pipeline.py`
 - 对已有 MinerU 产物做纯建图验证时，优先用 `scripts/run_standard_pipeline.py`
 - 如果当前兼容端点对 `/responses` 支持不稳定，先保持 `fallback_to_heuristic_on_llm_error=true`
+- （日志后续要更新为中文，加进度显示）
+- （报告对规范图谱的覆盖率计算）
+- （图rag）

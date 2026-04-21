@@ -30,6 +30,7 @@ class GraphMaterializationService:
         nodes: list[dict[str, Any]] = []
         edges: list[dict[str, Any]] = []
         embedding_documents: list[dict[str, Any]] = []
+        embedding_target_types = set(self.config.embedding.target_node_types)
         seen_nodes: set[str] = set()
         seen_edges: set[str] = set()
         clause_map = {clause["clause_uid"]: clause for clause in clauses}
@@ -43,15 +44,15 @@ class GraphMaterializationService:
                 return
             seen_nodes.add(node_uid)
             nodes.append(node)
-            if node.get("node_type") in set(self.config.embedding.target_node_types):
-                text_content = node.get("text_content")
-                if isinstance(text_content, str) and text_content.strip():
+            if node.get("node_type") in embedding_target_types:
+                embedding_text = node.get("embedding_text", node.get("text_content"))
+                if isinstance(embedding_text, str) and embedding_text.strip():
                     embedding_documents.append(
                         {
                             "node_uid": node_uid,
                             "standard_uid": standard_uid,
                             "node_type": node["node_type"],
-                            "text": text_content.strip(),
+                            "text": embedding_text.strip(),
                         }
                     )
 
@@ -113,6 +114,34 @@ class GraphMaterializationService:
             parent_uid = clause.get("parent_uid") or standard_uid
             add_edge("CONTAINS", parent_uid, clause["clause_uid"])
             children_by_parent[parent_uid].append(clause["clause_uid"])
+            for table in clause.get("tables", []):
+                table_label = table.get("table_caption") or table.get("table_title") or table.get("table_ref") or table["table_uid"]
+                table_text_content = '\n'.join(
+                    part for part in [' > '.join(clause.get('heading_path', [])), clause['clause_ref'], table_label] if part
+                ).strip()
+                table_embedding_text = '\n'.join(
+                    part
+                    for part in [
+                        ' > '.join(clause.get('heading_path', [])),
+                        clause['clause_ref'],
+                        table.get("table_title") or table_label,
+                        table.get("table_html"),
+                    ]
+                    if part
+                ).strip()
+                add_node(
+                    {
+                        "node_uid": table["table_uid"],
+                        "standard_uid": standard_uid,
+                        "node_type": "table",
+                        "label": table_label,
+                        "text_content": table_text_content,
+                        "embedding_text": table_embedding_text,
+                        "properties": table,
+                    }
+                )
+                add_edge("CONTAINS", clause["clause_uid"], table["table_uid"])
+                children_by_parent[clause["clause_uid"]].append(table["table_uid"])
 
         for siblings in children_by_parent.values():
             for left, right in zip(siblings, siblings[1:]):

@@ -27,6 +27,7 @@ class StorageConfig(BaseModel):
     downloads_dir: str = "data/downloads"
     uploads_dir: str = "data/uploads"
     kg_spaces_dir: str = "data/kg_spaces"
+    report_spaces_dir: str = "data/report_spaces"
     registry_path: str = "data/registry/standards.json"
 
 
@@ -90,7 +91,7 @@ class EmbeddingConfig(BaseModel):
     retry_backoff_seconds: float = 2.0
     api_key_env: str = "OPENAI_API_KEY"
     api_key: str | None = Field(default=None, repr=False)
-    target_node_types: list[str] = Field(default_factory=lambda: ["clause", "requirement"])
+    target_node_types: list[str] = Field(default_factory=lambda: ["clause", "requirement", "table"])
 
 
 class PostgresConfig(BaseModel):
@@ -149,6 +150,10 @@ class AppConfig(BaseModel):
         return self.root_dir / self.storage.kg_spaces_dir
 
     @property
+    def report_spaces_dir(self) -> Path:
+        return self.root_dir / self.storage.report_spaces_dir
+
+    @property
     def registry_path(self) -> Path:
         return self.root_dir / self.storage.registry_path
 
@@ -177,6 +182,9 @@ class AppConfig(BaseModel):
 
     def kg_space_dir_for(self, standard_id: str) -> Path:
         return self.kg_spaces_dir / self._safe_storage_segment(standard_id)
+
+    def report_space_dir_for(self, document_id: str) -> Path:
+        return self.report_spaces_dir / self._safe_storage_segment(document_id)
 
     @staticmethod
     def _safe_storage_segment(value: str) -> str:
@@ -230,6 +238,7 @@ def get_config() -> AppConfig:
         config.downloads_dir,
         config.uploads_dir,
         config.kg_spaces_dir,
+        config.report_spaces_dir,
         config.registry_path.parent,
         config.schema_dir,
     ]:

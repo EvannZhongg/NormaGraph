@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import UTC, datetime
 from dataclasses import dataclass, field
+from html import unescape
 from pathlib import Path
 import json
 import logging
@@ -14,6 +15,7 @@ from core.config import AppConfig, get_config
 from repositories.postgres_graph_store import PostgresGraphStore
 from services.graph_materialization import GraphMaterializationService
 from services.llm_extraction import LLMGraphExtractionService
+from services.standard_title_classification import StandardTitleClassificationService
 
 
 logger = logging.getLogger(__name__)
@@ -24,8 +26,10 @@ CHAPTER_TITLE_RE = re.compile(r'^(?P<ref>\d+)\s+(?P<title>.+)$')
 SECTION_TITLE_RE = re.compile(r'^(?P<ref>\d+\.\d+)\s+(?P<title>.+)$')
 APPENDIX_TITLE_RE = re.compile(r'^附录(?P<ref>[A-ZＡ-Ｚ])\s*(?P<title>.*)$')
 CLAUSE_START_RE = re.compile(r'^(?P<ref>\d+\.\d+\.\d+)\s*(?P<text>.*)$')
-LIST_ITEM_RE = re.compile(r'^(?P<ref>(?:\(?\d+\)?|\d+[）\.]))\s*(?P<text>.*)$')
+LIST_ITEM_RE = re.compile(r'^(?P<ref>(?:\(?\d+\)?(?=\s|$)|\d+[）]|(?:\d+\.(?!\d))))\s*(?P<text>.*)$')
+PARAGRAPH_LIST_ITEM_RE = re.compile(r'^(?P<ref>(?:\d+[）]|(?:\d+\.(?!\d))))\s*(?P<text>.*)$')
 STANDARD_REF_RE = re.compile(r'\b(?P<code>(?:GB/T|GB|SL|DL/T|SDJ|SLJ|CECS|JGJ/T|JGJ))\s*(?P<number>\d+(?:/\w+)?)(?:[-—](?P<year>\d{2,4}))?')
+TABLE_REF_RE = re.compile(r'表\s*(?P<ref>(?:[A-Z](?:\.\s*)?)?\d+(?:\.\d+)*(?:-\d+)*)', re.IGNORECASE)
 MUST_WORDS = ('应当', '应', '必须')
 SHOULD_WORDS = ('宜',)
 MAY_WORDS = ('可',)
@@ -65,12 +69,15 @@ class StandardPipelineService:
         self,
         config: AppConfig | None = None,
         llm_extraction_service: LLMGraphExtractionService | None = None,
+        title_classification_service: StandardTitleClassificationService | None = None,
         graph_materialization_service: GraphMaterializationService | None = None,
         embedding_client: EmbeddingsAPIClient | None = None,
         postgres_graph_store: PostgresGraphStore | None = None,
     ) -> None:
         self.config = config or get_config()
-        self.llm_extraction_service = llm_extraction_service or LLMGraphExtractionService(self.config, ResponsesAPIClient(self.config))
+        llm_client = ResponsesAPIClient(self.config)
+        self.llm_extraction_service = llm_extraction_service or LLMGraphExtractionService(self.config, llm_client)
+        self.title_classification_service = title_classification_service or StandardTitleClassificationService(self.config, ResponsesAPIClient(self.config))
         self.graph_materialization_service = graph_materialization_service or GraphMaterializationService(self.config)
         self.embedding_client = embedding_client or EmbeddingsAPIClient(self.config)
         self.postgres_graph_store = postgres_graph_store or PostgresGraphStore(self.config)
@@ -82,8 +89,9 @@ class StandardPipelineService:
 
         data = json.loads(content_list_path.read_text(encoding='utf-8'))
         normalized_blocks = self._flatten_content_list(data)
-        structure_nodes, clauses, metrics = self._build_structure(normalized_blocks, standard_uid)
+        structure_nodes, clauses, metrics, structure_warnings = self._build_structure(normalized_blocks, standard_uid)
         requirements, extraction_metrics, extraction_warnings = self._extract_requirements(clauses, standard_uid)
+        extraction_warnings = [*structure_warnings, *extraction_warnings]
         metrics.update(extraction_metrics)
         metrics['requirement_count'] = len(requirements)
         metrics['clauses_with_requirements'] = sum(1 for clause in clauses if clause.get('requirement_count', 0) > 0)
@@ -220,7 +228,18 @@ class StandardPipelineService:
                 bbox = item.get('bbox') or []
                 if block_type == 'title':
                     text = self._join_text_fragments(item.get('content', {}).get('title_content', []))
-                    blocks.append(self._make_block(page_idx, block_idx, None, 'title', text, bbox, item))
+                    blocks.append(
+                        self._make_block(
+                            page_idx,
+                            block_idx,
+                            None,
+                            'title',
+                            text,
+                            bbox,
+                            item,
+                            extra={'raw_title_level': (item.get('content') or {}).get('level')},
+                        )
+                    )
                 elif block_type == 'paragraph':
                     text = self._join_text_fragments(item.get('content', {}).get('paragraph_content', []))
                     blocks.append(self._make_block(page_idx, block_idx, None, 'paragraph', text, bbox, item))
@@ -229,25 +248,33 @@ class StandardPipelineService:
                         text = self._join_text_fragments(list_item.get('item_content', []))
                         blocks.append(self._make_block(page_idx, block_idx, item_idx, 'list_item', text, bbox, item))
                 elif block_type == 'table':
-                    text = self._table_to_text(item.get('content', {}))
+                    table_payload = self._table_to_payload(item.get('content', {}))
+                    text = table_payload.get('text', '')
                     if text:
-                        blocks.append(self._make_block(page_idx, block_idx, None, 'table', text, bbox, item))
+                        blocks.append(self._make_block(page_idx, block_idx, None, 'table', text, bbox, item, extra=table_payload))
         return blocks
 
-    def _build_structure(self, blocks: list[dict[str, Any]], standard_uid: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    def _build_structure(self, blocks: list[dict[str, Any]], standard_uid: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[str]]:
         nodes: list[dict[str, Any]] = []
         clauses: list[dict[str, Any]] = []
+        warnings: list[str] = []
         metrics = {
             'normalized_block_count': len(blocks),
             'structure_node_count': 0,
             'clause_count': 0,
             'main_clause_count': 0,
             'appendix_clause_count': 0,
+            'table_count': 0,
+            'rejected_title_count': 0,
             'orphan_text_block_count': 0,
             'continuation_block_count': 0,
             'title_classification': {},
+            'title_classification_mode': 'heuristic',
             'duplicate_clause_refs': [],
         }
+        title_decisions, title_warnings, title_metrics = self._resolve_title_classification(blocks, standard_uid)
+        warnings.extend(title_warnings)
+        metrics.update(title_metrics)
         title_counter: Counter[str] = Counter()
         current_body_kind = 'front_matter'
         current_appendix: dict[str, Any] | None = None
@@ -275,14 +302,29 @@ class StandardPipelineService:
                 ]
                 if title
             ]
+            current_clause['table_count'] = len(current_clause.get('tables', []))
             current_clause['requirement_count'] = 0
             current_clause['concepts'] = []
             clauses.append(current_clause)
             current_clause = None
 
-        for block in blocks:
-            title_info = self._classify_title(block['text_normalized']) if block['source_type'] == 'title' else None
-            if title_info:
+        for index, block in enumerate(blocks):
+            prev_block = blocks[index - 1] if index > 0 else None
+            next_block = blocks[index + 1] if index + 1 < len(blocks) else None
+            title_decision = title_decisions.get(block['block_id']) if block['source_type'] == 'title' else None
+            title_info = self._title_decision_to_structure_info(title_decision, block) if title_decision else None
+            should_accept = bool(title_info)
+            if title_info and metrics.get('title_classification_mode') != 'llm':
+                should_accept = self._should_accept_title_candidate(
+                    title_info=title_info,
+                    block=block,
+                    current_clause=current_clause,
+                    current_chapter=current_chapter,
+                    current_section=current_section,
+                    prev_block=prev_block,
+                    next_block=next_block,
+                )
+            if title_info and should_accept:
                 finalize_clause()
                 title_counter[title_info['node_type']] += 1
                 if title_info['node_type'] == 'appendix':
@@ -293,7 +335,7 @@ class StandardPipelineService:
                     current_section = None
                     nodes.append(current_appendix)
                     continue
-                if title_info['node_type'] == 'chapter':
+                if title_info['node_type'] in {'chapter', 'reference_standard'}:
                     if not appendix_title_seen:
                         current_body_kind = 'main'
                     current_chapter = self._make_structure_node(
@@ -316,6 +358,8 @@ class StandardPipelineService:
                     continue
                 nodes.append(self._make_structure_node(standard_uid, title_info, block, parent_uid=None))
                 continue
+            if title_info:
+                metrics['rejected_title_count'] += 1
 
             clause_match = CLAUSE_START_RE.match(block['text_normalized'])
             if clause_match:
@@ -336,6 +380,7 @@ class StandardPipelineService:
                     '_pages': {block['page_idx']},
                     '_bboxes': [block['bbox']],
                     'list_items': [],
+                    'tables': [],
                     'notes': [],
                 }
                 continue
@@ -348,13 +393,44 @@ class StandardPipelineService:
             current_clause['source_block_ids'].append(block['block_id'])
             current_clause['_pages'].add(block['page_idx'])
             current_clause['_bboxes'].append(block['bbox'])
+            if block['source_type'] == 'table':
+                table_index = len(current_clause['tables']) + 1
+                current_clause['tables'].append(
+                    {
+                        'table_uid': f"{current_clause['clause_uid']}#table{table_index}",
+                        'standard_uid': standard_uid,
+                        'parent_clause_uid': current_clause['clause_uid'],
+                        'clause_ref': current_clause['clause_ref'],
+                        'table_index': table_index,
+                        'table_ref': block.get('table_ref'),
+                        'table_title': block.get('table_title'),
+                        'table_caption': block.get('table_caption'),
+                        'table_html': block.get('table_html'),
+                        'table_footnote': block.get('table_footnote'),
+                        'table_type': block.get('table_type'),
+                        'table_nest_level': block.get('table_nest_level'),
+                        'image_path': block.get('table_image_path'),
+                        'source_page_idx': block['page_idx'],
+                        'source_bbox': block['bbox'],
+                        'source_block_id': block['block_id'],
+                    }
+                )
+                metrics['table_count'] += 1
+                caption_text = block.get('table_caption')
+                if caption_text:
+                    current_clause['_text_parts'].append(caption_text)
+                    current_clause['_normalized_parts'].append(self._normalize_text(caption_text))
+                current_clause['notes'].append('table_block')
+                continue
             list_match = LIST_ITEM_RE.match(block['text_normalized'])
-            if list_match and block['source_type'] == 'list_item':
+            paragraph_list_match = PARAGRAPH_LIST_ITEM_RE.match(block['text_normalized']) if block['source_type'] == 'paragraph' else None
+            item_match = list_match if block['source_type'] == 'list_item' else paragraph_list_match
+            if item_match:
                 current_clause['list_items'].append(
                     {
-                        'item_ref': list_match.group('ref'),
+                        'item_ref': item_match.group('ref'),
                         'text': block['text'],
-                        'text_normalized': list_match.group('text').strip() or block['text_normalized'],
+                        'text_normalized': item_match.group('text').strip() or block['text_normalized'],
                         'source_block_id': block['block_id'],
                         'page_idx': block['page_idx'],
                         'bbox': block['bbox'],
@@ -377,7 +453,7 @@ class StandardPipelineService:
         metrics['title_classification'] = dict(title_counter)
         ref_counter = Counter(clause['clause_uid'] for clause in clauses)
         metrics['duplicate_clause_refs'] = [ref for ref, count in ref_counter.items() if count > 1]
-        return nodes, clauses, metrics
+        return nodes, clauses, metrics, warnings
     def _extract_requirements(self, clauses: list[dict[str, Any]], standard_uid: str) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
         mode = self.config.knowledge_graph.extraction_mode
         warnings: list[str] = []
@@ -629,9 +705,20 @@ class StandardPipelineService:
             'confidence': round(min(clause['segmentation_confidence'], split_confidence), 2),
         }
 
-    def _make_block(self, page_idx: int, block_idx: int, item_idx: int | None, source_type: str, text: str, bbox: list[int], raw: dict[str, Any]) -> dict[str, Any]:
+    def _make_block(
+        self,
+        page_idx: int,
+        block_idx: int,
+        item_idx: int | None,
+        source_type: str,
+        text: str,
+        bbox: list[int],
+        raw: dict[str, Any],
+        *,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         block_id = f'p{page_idx:03d}-b{block_idx:03d}' + (f'-i{item_idx:02d}' if item_idx is not None else '')
-        return {
+        block = {
             'block_id': block_id,
             'page_idx': page_idx,
             'source_type': source_type,
@@ -640,6 +727,9 @@ class StandardPipelineService:
             'bbox': bbox,
             'raw_type': raw.get('type'),
         }
+        if extra:
+            block.update(extra)
+        return block
 
     def _join_text_fragments(self, fragments: list[dict[str, Any]]) -> str:
         return ''.join(fragment.get('content', '') for fragment in fragments if fragment.get('type') == 'text').strip()
@@ -650,9 +740,32 @@ class StandardPipelineService:
         normalized = MULTI_SPACE_RE.sub(' ', normalized)
         return normalized.strip()
 
+    def _table_to_payload(self, content: dict[str, Any]) -> dict[str, Any]:
+        caption = self._join_rich_fragments(content.get('table_caption') or [])
+        footnote = self._join_rich_fragments(content.get('table_footnote') or [], separator='\n')
+        html = str(content.get('html') or '').strip()
+        body_text = self._table_html_to_text(html) or self._table_body_to_text(content.get('table_body') or [])
+        title = self._normalize_text(caption) if caption else None
+        table_ref = self._extract_table_ref(title or '')
+        parts = [part for part in [caption, body_text, footnote] if part]
+        return {
+            'text': '\n'.join(parts).strip(),
+            'table_ref': table_ref,
+            'table_title': title or table_ref or '表格',
+            'table_caption': caption.strip() or None,
+            'table_html': html or None,
+            'table_footnote': footnote.strip() or None,
+            'table_image_path': str(((content.get('image_source') or {}).get('path') or '')).strip() or None,
+            'table_type': content.get('table_type'),
+            'table_nest_level': content.get('table_nest_level'),
+        }
+
     def _table_to_text(self, content: dict[str, Any]) -> str:
+        return self._table_to_payload(content).get('text', '')
+
+    def _table_body_to_text(self, table_body: list[Any]) -> str:
         pieces: list[str] = []
-        for row in content.get('table_body') or []:
+        for row in table_body:
             if not isinstance(row, list):
                 continue
             row_text = []
@@ -660,6 +773,42 @@ class StandardPipelineService:
                 row_text.append(str(cell.get('text', '')).strip() if isinstance(cell, dict) else str(cell).strip())
             pieces.append(' | '.join(part for part in row_text if part))
         return '\n'.join(piece for piece in pieces if piece).strip()
+
+    def _table_html_to_text(self, html: str) -> str:
+        if not html:
+            return ''
+        text = re.sub(r'<\s*br\s*/?\s*>', '\n', html, flags=re.IGNORECASE)
+        text = re.sub(r'</\s*tr\s*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<\s*tr\b[^>]*>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'</\s*t[dh]\s*>', ' | ', text, flags=re.IGNORECASE)
+        text = re.sub(r'<\s*t[dh]\b[^>]*>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', '', text)
+        text = unescape(text)
+        lines: list[str] = []
+        for raw_line in text.splitlines():
+            cells = [self._normalize_text(cell) for cell in raw_line.split('|')]
+            cells = [cell for cell in cells if cell]
+            if cells:
+                lines.append(' | '.join(cells))
+        return '\n'.join(lines).strip()
+
+    def _join_rich_fragments(self, fragments: Any, *, separator: str = '') -> str:
+        if isinstance(fragments, dict):
+            return self._join_rich_fragments(fragments.get('content'), separator=separator)
+        if isinstance(fragments, list):
+            parts = [self._join_rich_fragments(item, separator='') for item in fragments]
+            return separator.join(part for part in parts if part).strip()
+        if fragments is None:
+            return ''
+        return str(fragments).strip()
+
+    def _extract_table_ref(self, text: str) -> str | None:
+        if not text:
+            return None
+        match = TABLE_REF_RE.search(text)
+        if not match:
+            return None
+        return re.sub(r'\s+', '', match.group('ref'))
 
     def _classify_title(self, text: str) -> dict[str, str] | None:
         appendix = APPENDIX_TITLE_RE.match(text)
@@ -673,12 +822,172 @@ class StandardPipelineService:
             return {'node_type': 'chapter', 'ref': chapter.group('ref'), 'title': chapter.group('title').strip(), 'raw_text': text}
         return None
 
-    def _make_structure_node(self, standard_uid: str, title_info: dict[str, str], block: dict[str, Any], parent_uid: str | None) -> dict[str, Any]:
-        suffix = title_info['ref'].lower().replace('附录', 'appendix-')
+    def _resolve_title_classification(
+        self,
+        blocks: list[dict[str, Any]],
+        standard_uid: str,
+    ) -> tuple[dict[str, dict[str, Any]], list[str], dict[str, Any]]:
+        title_inventory = self._build_title_inventory(blocks)
+        if not title_inventory:
+            return {}, [], {
+                'title_classification_mode': 'heuristic',
+                'title_classifier_requested_count': 0,
+                'title_classifier_batch_count': 0,
+                'title_classifier_successful_count': 0,
+                'title_classifier_label_counts': {},
+            }
+
+        if not self.config.llm.enabled:
+            decisions = {item['title_id']: self._heuristic_title_decision(item) for item in title_inventory}
+            label_counts = Counter(item['label'] for item in decisions.values())
+            return decisions, [], {
+                'title_classification_mode': 'heuristic',
+                'title_classifier_requested_count': len(title_inventory),
+                'title_classifier_batch_count': 0,
+                'title_classifier_successful_count': len(decisions),
+                'title_classifier_label_counts': dict(sorted(label_counts.items())),
+            }
+
+        result = self.title_classification_service.classify_titles(standard_uid=standard_uid, title_inventory=title_inventory)
+        decisions = {item['title_id']: item for item in result.items}
+        return decisions, result.warnings, {
+            'title_classification_mode': 'llm',
+            **result.metrics,
+        }
+
+    def _build_title_inventory(self, blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        title_indices = [index for index, block in enumerate(blocks) if block.get('source_type') == 'title']
+        inventory: list[dict[str, Any]] = []
+        for order, block_index in enumerate(title_indices, start=1):
+            block = blocks[block_index]
+            previous_title = blocks[title_indices[order - 2]] if order > 1 else None
+            next_title = blocks[title_indices[order]] if order < len(title_indices) else None
+            prev_block = blocks[block_index - 1] if block_index > 0 else None
+            next_block = blocks[block_index + 1] if block_index + 1 < len(blocks) else None
+            inventory.append(
+                {
+                    'title_id': block['block_id'],
+                    'title_index': order,
+                    'page_idx': block['page_idx'],
+                    'text': block['text'],
+                    'text_normalized': block['text_normalized'],
+                    'raw_title_level': block.get('raw_title_level'),
+                    'previous_title': previous_title['text_normalized'] if previous_title else None,
+                    'next_title': next_title['text_normalized'] if next_title else None,
+                    'previous_block_preview': prev_block['text_normalized'] if prev_block else None,
+                    'next_block_preview': next_block['text_normalized'] if next_block else None,
+                }
+            )
+        return inventory
+
+    def _heuristic_title_decision(self, item: dict[str, Any]) -> dict[str, Any]:
+        title_info = self._classify_title(item['text_normalized'])
+        return {
+            **item,
+            'label': title_info['node_type'] if title_info else 'none',
+            'confidence': 1.0 if title_info else 0.0,
+            'rationale': 'heuristic_title_match' if title_info else 'heuristic_no_match',
+        }
+
+    def _title_decision_to_structure_info(
+        self,
+        title_decision: dict[str, Any],
+        block: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        label = str(title_decision.get('label') or '').strip().lower()
+        if label in {'none', 'clause'}:
+            return None
+        if label == 'appendix':
+            appendix = APPENDIX_TITLE_RE.match(block['text_normalized'])
+            if appendix:
+                return {
+                    'node_type': 'appendix',
+                    'ref': appendix.group('ref'),
+                    'title': appendix.group('title').strip() or f'附录{appendix.group("ref")}',
+                    'raw_text': block['text_normalized'],
+                }
+            return {
+                'node_type': 'appendix',
+                'ref': None,
+                'title': block['text_normalized'],
+                'raw_text': block['text_normalized'],
+            }
+        if label == 'section':
+            section = SECTION_TITLE_RE.match(block['text_normalized'])
+            if section:
+                return {
+                    'node_type': 'section',
+                    'ref': section.group('ref'),
+                    'title': section.group('title').strip(),
+                    'raw_text': block['text_normalized'],
+                }
+            return {
+                'node_type': 'section',
+                'ref': None,
+                'title': block['text_normalized'],
+                'raw_text': block['text_normalized'],
+            }
+        if label in {'chapter', 'reference_standard'}:
+            chapter = CHAPTER_TITLE_RE.match(block['text_normalized'])
+            ref = chapter.group('ref') if chapter and '.' not in chapter.group('ref') else None
+            title = chapter.group('title').strip() if chapter and '.' not in chapter.group('ref') else block['text_normalized']
+            return {
+                'node_type': label,
+                'ref': ref,
+                'title': title,
+                'raw_text': block['text_normalized'],
+            }
+        return None
+
+    def _should_accept_title_candidate(
+        self,
+        *,
+        title_info: dict[str, str],
+        block: dict[str, Any],
+        current_clause: dict[str, Any] | None,
+        current_chapter: dict[str, Any] | None,
+        current_section: dict[str, Any] | None,
+        prev_block: dict[str, Any] | None,
+        next_block: dict[str, Any] | None,
+    ) -> bool:
+        del current_chapter, current_section, prev_block
+        if title_info['node_type'] != 'chapter' or current_clause is None:
+            return True
+        candidate_ref = title_info.get('ref', '')
+        current_clause_ref = str(current_clause.get('clause_ref') or '')
+        current_top_ref = current_clause_ref.split('.', 1)[0]
+        if not candidate_ref.isdigit() or not current_top_ref.isdigit():
+            return True
+        candidate_num = int(candidate_ref)
+        current_num = int(current_top_ref)
+        if candidate_num < current_num:
+            return False
+        if candidate_num != current_num and self._looks_like_clause_inline_title(block['text_normalized'], next_block):
+            return False
+        return True
+
+    def _looks_like_clause_inline_title(self, text: str, next_block: dict[str, Any] | None) -> bool:
+        normalized = self._normalize_text(text)
+        if normalized.endswith(('：', ':')) or '如下' in normalized:
+            return True
+        if next_block is None:
+            return False
+        next_text = next_block.get('text_normalized') or ''
+        if next_block.get('source_type') == 'table':
+            return True
+        if LIST_ITEM_RE.match(next_text):
+            return True
+        if next_text.startswith(('表', '式中', '公式')):
+            return True
+        return False
+
+    def _make_structure_node(self, standard_uid: str, title_info: dict[str, Any], block: dict[str, Any], parent_uid: str | None) -> dict[str, Any]:
+        ref_value = str(title_info.get('ref') or block['block_id'])
+        suffix = ref_value.lower().replace('附录', 'appendix-')
         return {
             'node_uid': f"{standard_uid}:{title_info['node_type']}:{suffix}",
             'node_type': title_info['node_type'],
-            'ref': title_info['ref'],
+            'ref': title_info.get('ref'),
             'title': title_info['title'],
             'raw_text': title_info['raw_text'],
             'parent_uid': parent_uid,
@@ -872,6 +1181,7 @@ class StandardPipelineService:
             f'- Artifact dir: `{artifact_dir}`',
             f'- Extraction mode requested: {metrics.get("extraction_mode_requested")}',
             f'- Extraction mode effective: {metrics.get("extraction_mode_effective")}',
+            f'- Title classification mode: {metrics.get("title_classification_mode", "heuristic")}',
             f'- Normalized blocks: {metrics["normalized_block_count"]}',
             f'- Structure nodes: {metrics["structure_node_count"]}',
             f'- Clauses: {metrics["clause_count"]}',
