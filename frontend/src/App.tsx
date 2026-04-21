@@ -1,19 +1,21 @@
 import * as Dialog from '@radix-ui/react-dialog'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import * as Tooltip from '@radix-ui/react-tooltip'
-import { BookText, BotMessageSquare, Languages, MoonStar, Network, SunMedium, TerminalSquare, Zap } from 'lucide-react'
+import { BookText, BotMessageSquare, FileText, Languages, MoonStar, Network, SunMedium, TerminalSquare, Zap } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Navigate, NavLink, Route, Routes, useLocation } from 'react-router-dom'
 
 import { ApiDocsPage } from './pages/ApiDocsPage'
 import { DocumentsPage } from './pages/DocumentsPage'
 import { KnowledgeGraphPage } from './pages/KnowledgeGraphPage'
+import { ReportPage } from './pages/ReportPage'
 import { RetrievalPage } from './pages/RetrievalPage'
 import { t } from './lib/translations'
 import { useAppStore } from './store/app-store'
 
 const navItems = [
   { to: '/documents', labelKey: 'documents', icon: BookText },
+  { to: '/report', labelKey: 'report', icon: FileText },
   { to: '/knowledge-graph', labelKey: 'knowledgeGraph', icon: Network },
   { to: '/retrieval', labelKey: 'retrieval', icon: BotMessageSquare },
   { to: '/api', labelKey: 'api', icon: TerminalSquare },
@@ -140,6 +142,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<Navigate to="/documents" replace />} />
             <Route path="/documents" element={<DocumentsPage />} />
+            <Route path="/report" element={<ReportPage />} />
             <Route path="/knowledge-graph" element={<KnowledgeGraphPage />} />
             <Route path="/retrieval" element={<RetrievalPage />} />
             <Route path="/api" element={<ApiDocsPage />} />

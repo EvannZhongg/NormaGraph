@@ -4,6 +4,7 @@ const messages = {
   'zh-CN': {
     appTitle: 'NormaGraph',
     documents: 'Documents',
+    report: 'Report',
     knowledgeGraph: 'Knowledge Graph',
     retrieval: 'Retrieval',
     api: 'API',
@@ -26,6 +27,7 @@ const messages = {
   'en-US': {
     appTitle: 'NormaGraph',
     documents: 'Documents',
+    report: 'Report',
     knowledgeGraph: 'Knowledge Graph',
     retrieval: 'Retrieval',
     api: 'API',
