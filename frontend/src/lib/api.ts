@@ -43,6 +43,85 @@ export interface DocumentSummary {
   updatedAt?: string | null
 }
 
+export interface ReportSectionSummary {
+  sectionUid: string
+  parentSectionUid?: string | null
+  title: string
+  sectionKind: string
+  path: string[]
+  orderIndex: number
+  pageSpan: number[]
+  memberCount: number
+}
+
+export interface ReportUnitSummary {
+  unitUid: string
+  parentSectionUid?: string | null
+  unitType: string
+  sectionPath: string[]
+  structuralPath: string[]
+  text: string
+  textNormalized: string
+  orderIndex: number
+  pageSpan: number[]
+}
+
+export interface ReportSpaceDetail {
+  documentId: string
+  reportSpaceDir: string
+  artifactDir?: string | null
+  metrics: Record<string, unknown>
+  sections: ReportSectionSummary[]
+  reportUnits: ReportUnitSummary[]
+}
+
+export interface ReportComparisonItem {
+  clauseId: string
+  clauseRef?: string | null
+  sectionId?: string | null
+  chapterId?: string | null
+  label: string
+  status: 'covered' | 'partial' | 'missing' | 'violated' | 'not_applicable'
+  reason: string
+  reportEvidence?: string | null
+}
+
+export interface ReportUnitComparisonResult {
+  documentId: string
+  reportUnitId: string
+  parentSectionUid?: string | null
+  standardId: string
+  summary: string
+  coverageScore: number
+  chapterRoutingReasoning?: string | null
+  sectionRoutingReasoning?: string | null
+  matchedChapterIds: string[]
+  matchedSectionIds: string[]
+  items: ReportComparisonItem[]
+  graph: GraphWorkbenchData
+}
+
+export interface ReportComparisonResult extends ReportUnitComparisonResult {}
+
+export interface ReportComparisonDetail {
+  documentId: string
+  standardId: string
+  status: JobStatus
+  progress: number
+  totalUnits: number
+  completedUnits: number
+  startedAt?: string | null
+  updatedAt?: string | null
+  completedAt?: string | null
+  summary: string
+  coverageScore: number
+  matchedChapterIds: string[]
+  matchedSectionIds: string[]
+  items: ReportComparisonItem[]
+  unitResults: ReportUnitComparisonResult[]
+  error?: string | null
+}
+
 export interface KgSpaceSummary {
   standardId: string
   code: string
@@ -205,6 +284,30 @@ export async function uploadDocument(formData: FormData) {
 export async function listDocumentJobs(documentId: string) {
   const response = await api.get<{ items: IngestionJob[] }>(`/v1/documents/${documentId}/jobs`)
   return response.data.items
+}
+
+export async function getReportSpace(documentId: string) {
+  const response = await api.get<ReportSpaceDetail>(`/v1/report-spaces/${documentId}`)
+  return response.data
+}
+
+export async function compareReportUnit(documentId: string, unitUid: string, standardId: string) {
+  const response = await api.post<ReportComparisonResult>(`/v1/report-spaces/${documentId}/units/${encodeURIComponent(unitUid)}/compare`, {
+    standardId,
+  })
+  return response.data
+}
+
+export async function startReportComparison(documentId: string, standardId: string) {
+  const response = await api.post<ReportComparisonDetail>(`/v1/report-spaces/${documentId}/comparisons`, {
+    standardId,
+  })
+  return response.data
+}
+
+export async function getReportComparison(documentId: string, standardId: string) {
+  const response = await api.get<ReportComparisonDetail>(`/v1/report-spaces/${documentId}/comparisons/${encodeURIComponent(standardId)}`)
+  return response.data
 }
 
 export async function retryDocument(documentId: string) {

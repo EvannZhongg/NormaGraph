@@ -57,6 +57,9 @@ const DEFAULT_NODE_PALETTE: NodePalette = {
 
 const NODE_TYPE_PALETTE: Record<string, NodePalette> = {
   standard: { color: '#0f766e', soft: 'rgba(15, 118, 110, 0.18)', text: '#0f766e' },
+  report: { color: '#0f766e', soft: 'rgba(15, 118, 110, 0.18)', text: '#0f766e' },
+  report_unit: { color: '#16c784', soft: 'rgba(22, 199, 132, 0.18)', text: '#0fa76d' },
+  report_section: { color: '#14b8a6', soft: 'rgba(20, 184, 166, 0.16)', text: '#0f766e' },
   chapter: { color: '#2563eb', soft: 'rgba(37, 99, 235, 0.16)', text: '#1d4ed8' },
   section: { color: '#0891b2', soft: 'rgba(8, 145, 178, 0.16)', text: '#0e7490' },
   clause: { color: '#4f46e5', soft: 'rgba(79, 70, 229, 0.16)', text: '#4338ca' },
@@ -71,6 +74,10 @@ const EDGE_TYPE_COLORS: Record<string, string> = {
   derives_requirement: 'rgba(220, 38, 38, 0.38)',
   about: 'rgba(8, 145, 178, 0.28)',
   cites_standard: 'rgba(79, 70, 229, 0.28)',
+  covered: 'rgba(22, 163, 74, 0.36)',
+  partial: 'rgba(245, 158, 11, 0.36)',
+  missing: 'rgba(100, 116, 139, 0.32)',
+  violated: 'rgba(220, 38, 38, 0.36)',
   next: 'rgba(100, 116, 139, 0.24)',
 }
 
