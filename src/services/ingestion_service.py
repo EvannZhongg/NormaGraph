@@ -14,6 +14,7 @@ from typing import Any, Sequence
 import httpx
 from fastapi import BackgroundTasks
 
+from adapters.llm_client import ResponsesAPIClient
 from adapters.mineru_client import MinerUApiError, MinerUClient
 from core.config import AppConfig
 from models.schemas import (
@@ -26,12 +27,14 @@ from models.schemas import (
     IngestionJob,
     KgSpaceDetail,
     KgSpaceSummary,
+    ReportComparisonDetail,
     RequirementDetail,
     StandardDetail,
 )
 from repositories.job_store import JobStore
 from repositories.standard_registry import StandardRegistry
 from services.normalization import NormalizationService
+from services.report_comparison_agent import ReportComparisonAgentService
 from services.report_pipeline import ReportPipelineService
 from services.standard_pipeline import StandardPipelineService
 
@@ -64,6 +67,7 @@ class IngestionService:
         self.normalization_service = normalization_service
         self.standard_pipeline_service = standard_pipeline_service
         self.report_pipeline_service = report_pipeline_service
+        self.report_comparison_agent = ReportComparisonAgentService(config, ResponsesAPIClient(config))
 
     def create_job(self, request: CreateIngestionJobRequest, background_tasks: BackgroundTasks) -> IngestionJob:
         source_path = self._resolve_source_path(request.sourcePath)
@@ -98,6 +102,235 @@ class IngestionService:
 
     def list_document_jobs(self, document_id: str) -> list[IngestionJob]:
         return sorted(self.job_store.list_by_document(document_id), key=lambda item: item.updatedAt, reverse=True)
+
+    def get_report_space_detail(self, document_id: str) -> dict[str, Any]:
+        report_space_dir = self.config.report_space_dir_for(document_id)
+        if not report_space_dir.exists():
+            raise FileNotFoundError(f"Report space {document_id} was not found.")
+
+        sections_path = report_space_dir / "sections.json"
+        units_path = report_space_dir / "report_units.json"
+        metrics_path = report_space_dir / "segmentation_metrics.json"
+        manifest_path = report_space_dir / "space_manifest.json"
+        if not sections_path.exists() or not units_path.exists():
+            raise FileNotFoundError(f"Report space {document_id} is incomplete.")
+
+        sections = json.loads(sections_path.read_text(encoding="utf-8"))
+        report_units = json.loads(units_path.read_text(encoding="utf-8"))
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.exists() else {}
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+
+        return {
+            "documentId": document_id,
+            "reportSpaceDir": str(report_space_dir),
+            "artifactDir": manifest.get("artifact_dir"),
+            "metrics": metrics,
+            "sections": [
+                {
+                    "sectionUid": item.get("section_uid"),
+                    "parentSectionUid": item.get("parent_section_uid"),
+                    "title": item.get("title") or "",
+                    "sectionKind": item.get("section_kind") or "",
+                    "path": item.get("path") or [],
+                    "orderIndex": int(item.get("order_index") or 0),
+                    "pageSpan": item.get("page_span") or [],
+                    "memberCount": int(item.get("member_count") or 0),
+                }
+                for item in sections
+            ],
+            "reportUnits": [
+                {
+                    "unitUid": item.get("unit_uid"),
+                    "parentSectionUid": item.get("parent_section_uid"),
+                    "unitType": item.get("unit_type") or "",
+                    "sectionPath": item.get("section_path") or [],
+                    "structuralPath": item.get("structural_path") or [],
+                    "text": item.get("text") or "",
+                    "textNormalized": item.get("text_normalized") or item.get("text") or "",
+                    "orderIndex": int(item.get("order_index") or 0),
+                    "pageSpan": item.get("source_page_span") or [],
+                }
+                for item in report_units
+            ],
+        }
+
+    def get_report_comparison_detail(self, document_id: str, standard_id: str) -> dict[str, Any]:
+        comparison_path = self._report_comparison_path(document_id, standard_id)
+        if not comparison_path.exists():
+            raise FileNotFoundError(f"Report comparison {document_id} / {standard_id} was not found.")
+        payload = json.loads(comparison_path.read_text(encoding="utf-8"))
+        return ReportComparisonDetail.model_validate(payload).model_dump(mode="json")
+
+    def start_report_comparison(
+        self,
+        document_id: str,
+        standard_id: str,
+        background_tasks: BackgroundTasks,
+    ) -> dict[str, Any]:
+        report_detail = self.get_report_space_detail(document_id)
+        text_units = self._list_text_report_units(report_detail)
+        if not text_units:
+            raise FileNotFoundError(f"Report {document_id} does not contain text units for comparison.")
+
+        existing = self._load_report_comparison(document_id, standard_id)
+        if existing and existing.get("status") in {"queued", "running", "succeeded"}:
+            return existing
+
+        now = datetime.now(UTC)
+        detail = {
+            "documentId": document_id,
+            "standardId": standard_id,
+            "status": "queued",
+            "progress": 0.0,
+            "totalUnits": len(text_units),
+            "completedUnits": 0,
+            "startedAt": now,
+            "updatedAt": now,
+            "completedAt": None,
+            "summary": "",
+            "coverageScore": 0.0,
+            "matchedChapterIds": [],
+            "matchedSectionIds": [],
+            "items": [],
+            "unitResults": [],
+            "error": None,
+        }
+        self._save_report_comparison(document_id, standard_id, detail)
+        background_tasks.add_task(self._run_report_comparison, document_id, standard_id)
+        return ReportComparisonDetail.model_validate(detail).model_dump(mode="json")
+
+    def compare_report_unit(self, document_id: str, unit_uid: str, standard_id: str) -> dict[str, Any]:
+        comparison = self._load_report_comparison(document_id, standard_id)
+        if comparison:
+            unit_result = next((item for item in comparison.get("unitResults") or [] if item.get("reportUnitId") == unit_uid), None)
+            if unit_result:
+                return unit_result
+
+        report_detail = self.get_report_space_detail(document_id)
+        report_unit = next((item for item in report_detail["reportUnits"] if item["unitUid"] == unit_uid), None)
+        if report_unit is None:
+            raise FileNotFoundError(f"Report unit {unit_uid} was not found in {document_id}.")
+
+        nodes, edges, _ = self._load_graph_records(standard_id)
+        hierarchy = self._build_standard_hierarchy(nodes, edges)
+        chapter_candidates = hierarchy["chapters"]
+        section_candidates = hierarchy["sections"]
+        clause_candidates = hierarchy["clauses"]
+        if not chapter_candidates or not clause_candidates:
+            raise FileNotFoundError(f"KG space {standard_id} does not contain enough graph data for comparison.")
+
+        agent_result = self.report_comparison_agent.compare_report_unit(
+            report_unit=report_unit,
+            standard_id=standard_id,
+            chapter_candidates=chapter_candidates,
+            section_candidates=section_candidates,
+            clause_candidates=clause_candidates,
+        )
+        return self._materialize_report_unit_result(
+            document_id=document_id,
+            report_unit=report_unit,
+            standard_id=standard_id,
+            nodes=nodes,
+            edges=edges,
+            clause_candidates=clause_candidates,
+            agent_result=agent_result,
+        )
+
+    def _run_report_comparison(self, document_id: str, standard_id: str) -> None:
+        detail = self._load_report_comparison(document_id, standard_id)
+        if detail is None:
+            raise FileNotFoundError(f"Report comparison {document_id} / {standard_id} was not found.")
+
+        try:
+            report_detail = self.get_report_space_detail(document_id)
+            text_units = self._list_text_report_units(report_detail)
+            if not text_units:
+                raise FileNotFoundError(f"Report {document_id} does not contain text units for comparison.")
+
+            nodes, edges, _ = self._load_graph_records(standard_id)
+            hierarchy = self._build_standard_hierarchy(nodes, edges)
+            chapter_candidates = hierarchy["chapters"]
+            section_candidates = hierarchy["sections"]
+            clause_candidates = hierarchy["clauses"]
+            if not chapter_candidates or not clause_candidates:
+                raise FileNotFoundError(f"KG space {standard_id} does not contain enough graph data for comparison.")
+
+            section_scopes = self._build_report_section_scopes(report_detail, text_units)
+            total_steps = max(len(section_scopes) + len(text_units), 1)
+            completed_steps = 0
+
+            detail["status"] = "running"
+            detail["progress"] = 0.0
+            detail["completedUnits"] = 0
+            detail["unitResults"] = []
+            detail["items"] = []
+            detail["error"] = None
+            detail["updatedAt"] = datetime.now(UTC)
+            self._save_report_comparison(document_id, standard_id, detail)
+
+            routing_by_scope: dict[str, dict[str, Any]] = {}
+            for scope in section_scopes:
+                routing = self.report_comparison_agent.route_report_scope(
+                    report_scope=scope,
+                    standard_id=standard_id,
+                    chapter_candidates=chapter_candidates,
+                    section_candidates=section_candidates,
+                )
+                routing_by_scope[scope["scope_uid"]] = routing
+                completed_steps += 1
+                detail["progress"] = completed_steps / total_steps
+                detail["updatedAt"] = datetime.now(UTC)
+                self._save_report_comparison(document_id, standard_id, detail)
+
+            unit_results: list[dict[str, Any]] = []
+            for report_unit in text_units:
+                route_scope_id = str(report_unit.get("parentSectionUid") or report_unit["unitUid"])
+                routing = routing_by_scope.get(route_scope_id)
+                if routing is None:
+                    raise FileNotFoundError(f"Report route {route_scope_id} was not found for {document_id}.")
+                agent_result = self.report_comparison_agent.assess_report_unit(
+                    report_unit=report_unit,
+                    standard_id=standard_id,
+                    selected_chapters=routing["selected_chapters"],
+                    selected_sections=routing["selected_sections"],
+                    clause_candidates=clause_candidates,
+                    chapter_routing_reasoning=routing["chapter_routing_reasoning"],
+                    section_routing_reasoning=routing["section_routing_reasoning"],
+                )
+                unit_result = self._materialize_report_unit_result(
+                    document_id=document_id,
+                    report_unit=report_unit,
+                    standard_id=standard_id,
+                    nodes=nodes,
+                    edges=edges,
+                    clause_candidates=clause_candidates,
+                    agent_result=agent_result,
+                )
+                unit_results.append(unit_result)
+                completed_steps += 1
+                detail["completedUnits"] = len(unit_results)
+                detail["progress"] = completed_steps / total_steps
+                detail["unitResults"] = unit_results
+                detail["updatedAt"] = datetime.now(UTC)
+                self._save_report_comparison(document_id, standard_id, detail)
+
+            aggregate = self._aggregate_report_comparison(unit_results, clause_candidates)
+            detail["status"] = "succeeded"
+            detail["progress"] = 1.0
+            detail["summary"] = aggregate["summary"]
+            detail["coverageScore"] = aggregate["coverageScore"]
+            detail["matchedChapterIds"] = aggregate["matchedChapterIds"]
+            detail["matchedSectionIds"] = aggregate["matchedSectionIds"]
+            detail["items"] = aggregate["items"]
+            detail["completedAt"] = datetime.now(UTC)
+            detail["updatedAt"] = detail["completedAt"]
+            self._save_report_comparison(document_id, standard_id, detail)
+        except Exception as exc:
+            detail["status"] = "failed"
+            detail["error"] = str(exc)
+            detail["updatedAt"] = datetime.now(UTC)
+            self._save_report_comparison(document_id, standard_id, detail)
+            raise
 
     def list_documents(self) -> list[DocumentSummary]:
         documents: dict[str, DocumentSummary] = {}
@@ -807,6 +1040,406 @@ class IngestionService:
             "edgeType": str(edge.get("edge_type") or "RELATED_TO"),
             "properties": properties,
         }
+
+    def _build_standard_hierarchy(self, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        node_map = {str(node.get("node_uid") or ""): node for node in nodes if node.get("node_uid")}
+        children_by_id: dict[str, list[str]] = defaultdict(list)
+        parent_by_id: dict[str, str] = {}
+        for edge in edges:
+            if str(edge.get("edge_type") or "").upper() != "CONTAINS":
+                continue
+            source_uid = str(edge.get("source_uid") or "")
+            target_uid = str(edge.get("target_uid") or "")
+            if source_uid in node_map and target_uid in node_map:
+                children_by_id[source_uid].append(target_uid)
+                parent_by_id[target_uid] = source_uid
+
+        chapters: list[dict[str, Any]] = []
+        sections: list[dict[str, Any]] = []
+        clauses: list[dict[str, Any]] = []
+
+        for node_uid, node in node_map.items():
+            node_type = str(node.get("node_type") or "")
+            properties = dict(node.get("properties") or {})
+            if node_type == "chapter":
+                chapters.append(
+                    {
+                        "id": node_uid,
+                        "ref": properties.get("ref"),
+                        "label": self._graph_node_label(node),
+                        "title": properties.get("title") or self._graph_node_label(node),
+                    }
+                )
+            elif node_type == "section":
+                parent_id = parent_by_id.get(node_uid)
+                sections.append(
+                    {
+                        "id": node_uid,
+                        "chapter_id": parent_id,
+                        "ref": properties.get("ref"),
+                        "label": self._graph_node_label(node),
+                        "title": properties.get("title") or self._graph_node_label(node),
+                        "scope_type": "section",
+                    }
+                )
+            elif node_type == "clause":
+                parent_id = parent_by_id.get(node_uid)
+                chapter_id = None
+                section_id = None
+                if parent_id:
+                    parent_node = node_map.get(parent_id)
+                    if parent_node and str(parent_node.get("node_type") or "") == "section":
+                        section_id = parent_id
+                        chapter_id = parent_by_id.get(parent_id)
+                    elif parent_node and str(parent_node.get("node_type") or "") == "chapter":
+                        chapter_id = parent_id
+                clauses.append(
+                    {
+                        "id": node_uid,
+                        "section_id": section_id or chapter_id,
+                        "chapter_id": chapter_id,
+                        "clause_ref": properties.get("clause_ref"),
+                        "label": self._graph_node_label(node),
+                        "text": properties.get("source_text_normalized") or node.get("text_content") or "",
+                    }
+                )
+
+        chapter_ids_with_sections = {item["chapter_id"] for item in sections if item.get("chapter_id")}
+        for chapter in chapters:
+            if chapter["id"] in chapter_ids_with_sections:
+                continue
+            sections.append(
+                {
+                    "id": chapter["id"],
+                    "chapter_id": chapter["id"],
+                    "ref": chapter.get("ref"),
+                    "label": chapter.get("label"),
+                    "title": chapter.get("title"),
+                    "scope_type": "chapter_scope",
+                }
+            )
+
+        chapters.sort(key=lambda item: self._sort_key(item.get("ref"), item["id"]))
+        sections.sort(key=lambda item: self._sort_key(item.get("ref"), item["id"]))
+        clauses.sort(key=lambda item: self._sort_key(item.get("clause_ref"), item["id"]))
+        return {
+            "chapters": chapters,
+            "sections": sections,
+            "clauses": clauses,
+        }
+
+    def _list_text_report_units(self, report_detail: dict[str, Any]) -> list[dict[str, Any]]:
+        return sorted(
+            [item for item in report_detail["reportUnits"] if item.get("unitType") == "text"],
+            key=lambda item: (int(item.get("orderIndex") or 0), str(item.get("unitUid") or "")),
+        )
+
+    def _build_report_section_scopes(
+        self,
+        report_detail: dict[str, Any],
+        text_units: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        sections_by_id = {item["sectionUid"]: item for item in report_detail["sections"] if item.get("sectionUid")}
+        grouped_units: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for unit in text_units:
+            group_id = str(unit.get("parentSectionUid") or unit["unitUid"])
+            grouped_units[group_id].append(unit)
+
+        scopes: list[dict[str, Any]] = []
+        used_scope_ids: set[str] = set()
+        ordered_sections = sorted(report_detail["sections"], key=lambda item: (int(item.get("orderIndex") or 0), str(item.get("sectionUid") or "")))
+        for section in ordered_sections:
+            section_uid = str(section.get("sectionUid") or "")
+            units = grouped_units.get(section_uid)
+            if not section_uid or not units:
+                continue
+            scopes.append(self._build_report_scope_payload(section_uid, section, units))
+            used_scope_ids.add(section_uid)
+
+        for group_id, units in grouped_units.items():
+            if group_id in used_scope_ids:
+                continue
+            section = sections_by_id.get(group_id)
+            scopes.append(self._build_report_scope_payload(group_id, section, units))
+
+        scopes.sort(key=lambda item: (int(item.get("order_index") or 0), str(item.get("scope_uid") or "")))
+        return scopes
+
+    def _build_report_scope_payload(
+        self,
+        scope_uid: str,
+        section: dict[str, Any] | None,
+        units: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        ordered_units = sorted(units, key=lambda item: (int(item.get("orderIndex") or 0), str(item.get("unitUid") or "")))
+        text_parts = [str(item.get("textNormalized") or item.get("text") or "").strip() for item in ordered_units]
+        page_values = [int(page) for item in ordered_units for page in (item.get("pageSpan") or []) if isinstance(page, int)]
+        section_path = list(section.get("path") or []) if section else list(ordered_units[0].get("sectionPath") or [])
+        title = (
+            (section.get("title") if section else None)
+            or (section_path[-1] if section_path else None)
+            or str(scope_uid)
+        )
+        return {
+            "scope_uid": scope_uid,
+            "title": title,
+            "section_path": section_path,
+            "structural_path": list(ordered_units[0].get("structuralPath") or []),
+            "text": "\n\n".join(part for part in text_parts if part),
+            "text_normalized": "\n\n".join(part for part in text_parts if part),
+            "page_span": [min(page_values), max(page_values)] if page_values else [],
+            "order_index": int(section.get("orderIndex") or 0) if section else int(ordered_units[0].get("orderIndex") or 0),
+            "unit_ids": [str(item.get("unitUid") or "") for item in ordered_units],
+        }
+
+    def _materialize_report_unit_result(
+        self,
+        *,
+        document_id: str,
+        report_unit: dict[str, Any],
+        standard_id: str,
+        nodes: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+        clause_candidates: list[dict[str, Any]],
+        agent_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        clause_info_by_id = {item["id"]: item for item in clause_candidates}
+        items: list[dict[str, Any]] = []
+        for item in agent_result["items"]:
+            clause_info = clause_info_by_id[item["clause_id"]]
+            items.append(
+                {
+                    "clauseId": item["clause_id"],
+                    "clauseRef": clause_info.get("clause_ref"),
+                    "sectionId": clause_info.get("section_id"),
+                    "chapterId": clause_info.get("chapter_id"),
+                    "label": clause_info.get("label") or item["clause_id"],
+                    "status": item["status"],
+                    "reason": item["reason"],
+                    "reportEvidence": item.get("report_evidence"),
+                }
+            )
+
+        graph = self._build_report_comparison_graph(
+            document_id=document_id,
+            report_unit=report_unit,
+            standard_id=standard_id,
+            nodes=nodes,
+            edges=edges,
+            matched_chapter_ids=agent_result["chapter_ids"],
+            matched_section_ids=agent_result["section_ids"],
+            comparison_items=items,
+        )
+        return {
+            "documentId": document_id,
+            "reportUnitId": report_unit["unitUid"],
+            "parentSectionUid": report_unit.get("parentSectionUid"),
+            "standardId": standard_id,
+            "summary": agent_result["summary"],
+            "coverageScore": agent_result["coverage_score"],
+            "chapterRoutingReasoning": agent_result["chapter_routing_reasoning"],
+            "sectionRoutingReasoning": agent_result["section_routing_reasoning"],
+            "matchedChapterIds": agent_result["chapter_ids"],
+            "matchedSectionIds": agent_result["section_ids"],
+            "items": items,
+            "graph": graph,
+        }
+
+    def _aggregate_report_comparison(
+        self,
+        unit_results: list[dict[str, Any]],
+        clause_candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        clause_info_by_id = {item["id"]: item for item in clause_candidates if item.get("id")}
+        items_by_clause: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        matched_chapter_ids: set[str] = set()
+        matched_section_ids: set[str] = set()
+        for unit_result in unit_results:
+            matched_chapter_ids.update(str(item) for item in unit_result.get("matchedChapterIds") or [])
+            matched_section_ids.update(str(item) for item in unit_result.get("matchedSectionIds") or [])
+            for item in unit_result.get("items") or []:
+                clause_id = str(item.get("clauseId") or "")
+                if clause_id:
+                    items_by_clause[clause_id].append(item)
+
+        aggregated_items: list[dict[str, Any]] = []
+        for clause_id in sorted(items_by_clause, key=lambda value: self._sort_key(clause_info_by_id.get(value, {}).get("clause_ref"), value)):
+            clause_info = clause_info_by_id.get(clause_id, {})
+            clause_items = items_by_clause[clause_id]
+            status = self._aggregate_item_status(clause_items)
+            reasons = [str(item.get("reason") or "").strip() for item in clause_items if str(item.get("reason") or "").strip()]
+            evidences = [str(item.get("reportEvidence") or "").strip() for item in clause_items if str(item.get("reportEvidence") or "").strip()]
+            aggregated_items.append(
+                {
+                    "clauseId": clause_id,
+                    "clauseRef": clause_info.get("clause_ref"),
+                    "sectionId": clause_info.get("section_id"),
+                    "chapterId": clause_info.get("chapter_id"),
+                    "label": clause_info.get("label") or clause_id,
+                    "status": status,
+                    "reason": " | ".join(dict.fromkeys(reasons))[:2000],
+                    "reportEvidence": evidences[0] if evidences else None,
+                }
+            )
+
+        coverage_score = self._compute_report_coverage_score(aggregated_items)
+        summary = self._build_report_comparison_summary(aggregated_items)
+        return {
+            "summary": summary,
+            "coverageScore": coverage_score,
+            "matchedChapterIds": sorted(matched_chapter_ids),
+            "matchedSectionIds": sorted(matched_section_ids),
+            "items": aggregated_items,
+        }
+
+    def _aggregate_item_status(self, items: list[dict[str, Any]]) -> str:
+        statuses = {str(item.get("status") or "") for item in items}
+        if "violated" in statuses:
+            return "violated"
+        if "covered" in statuses:
+            return "covered"
+        if "partial" in statuses:
+            return "partial"
+        if "missing" in statuses:
+            return "missing"
+        return "not_applicable"
+
+    def _compute_report_coverage_score(self, items: list[dict[str, Any]]) -> float:
+        applicable_items = [item for item in items if item.get("status") != "not_applicable"]
+        if not applicable_items:
+            return 0.0
+        score = 0.0
+        for item in applicable_items:
+            status = item.get("status")
+            if status == "covered":
+                score += 1.0
+            elif status == "partial":
+                score += 0.5
+        return round(score / len(applicable_items), 4)
+
+    def _build_report_comparison_summary(self, items: list[dict[str, Any]]) -> str:
+        counts = Counter(str(item.get("status") or "") for item in items)
+        return (
+            f"covered={counts.get('covered', 0)}, partial={counts.get('partial', 0)}, "
+            f"missing={counts.get('missing', 0)}, violated={counts.get('violated', 0)}, "
+            f"not_applicable={counts.get('not_applicable', 0)}"
+        )
+
+    def _report_comparison_dir(self, document_id: str) -> Path:
+        report_space_dir = self.config.report_space_dir_for(document_id)
+        if not report_space_dir.exists():
+            raise FileNotFoundError(f"Report space {document_id} was not found.")
+        path = report_space_dir / "comparisons"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _report_comparison_path(self, document_id: str, standard_id: str) -> Path:
+        safe_standard_id = self.config._safe_storage_segment(standard_id)
+        return self._report_comparison_dir(document_id) / f"{safe_standard_id}.json"
+
+    def _load_report_comparison(self, document_id: str, standard_id: str) -> dict[str, Any] | None:
+        path = self._report_comparison_path(document_id, standard_id)
+        if not path.exists():
+            return None
+        return ReportComparisonDetail.model_validate(json.loads(path.read_text(encoding="utf-8"))).model_dump(mode="json")
+
+    def _save_report_comparison(self, document_id: str, standard_id: str, payload: dict[str, Any]) -> None:
+        path = self._report_comparison_path(document_id, standard_id)
+        validated = ReportComparisonDetail.model_validate(payload)
+        path.write_text(validated.model_dump_json(indent=2), encoding="utf-8")
+
+    def _build_report_comparison_graph(
+        self,
+        *,
+        document_id: str,
+        report_unit: dict[str, Any],
+        standard_id: str,
+        nodes: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+        matched_chapter_ids: list[str],
+        matched_section_ids: list[str],
+        comparison_items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        node_map = {str(node.get("node_uid") or ""): node for node in nodes if node.get("node_uid")}
+        contains_edges = [edge for edge in edges if str(edge.get("edge_type") or "").upper() == "CONTAINS"]
+        parent_by_id: dict[str, str] = {}
+        for edge in contains_edges:
+            source_uid = str(edge.get("source_uid") or "")
+            target_uid = str(edge.get("target_uid") or "")
+            if source_uid in node_map and target_uid in node_map:
+                parent_by_id[target_uid] = source_uid
+
+        selected_clause_ids = [
+            item["clauseId"]
+            for item in comparison_items
+            if item["status"] in {"covered", "partial", "missing", "violated"}
+        ]
+        included_ids: set[str] = {standard_id, *matched_chapter_ids, *matched_section_ids, *selected_clause_ids}
+        for clause_id in list(selected_clause_ids):
+            current_id = clause_id
+            while current_id in parent_by_id:
+                current_id = parent_by_id[current_id]
+                included_ids.add(current_id)
+
+        report_node_id = f"report-compare:{document_id}:{report_unit['unitUid']}"
+        workbench_nodes = [
+            {
+                "id": report_node_id,
+                "label": "Report Unit",
+                "nodeType": "report_unit",
+                "properties": {
+                    "document_id": document_id,
+                    "unit_uid": report_unit["unitUid"],
+                    "text_content": report_unit.get("textNormalized") or report_unit.get("text") or "",
+                    "section_path": report_unit.get("sectionPath") or [],
+                },
+                "degree": 0,
+            }
+        ]
+        degree_map = self._build_degree_map(nodes, edges)
+        for node_id in included_ids:
+            node = node_map.get(node_id)
+            if node is None:
+                continue
+            workbench_nodes.append(self._serialize_workbench_node(node, degree_map.get(node_id, 0)))
+
+        workbench_edges = [
+            self._serialize_workbench_edge(edge)
+            for edge in contains_edges
+            if str(edge.get("source_uid") or "") in included_ids and str(edge.get("target_uid") or "") in included_ids
+        ]
+        for index, item in enumerate(comparison_items, start=1):
+            if item["status"] not in {"covered", "partial", "missing", "violated"}:
+                continue
+            workbench_edges.append(
+                {
+                    "id": f"report-compare-edge:{index}",
+                    "source": report_node_id,
+                    "target": item["clauseId"],
+                    "edgeType": item["status"].upper(),
+                    "properties": {
+                        "reason": item["reason"],
+                        "report_evidence": item.get("reportEvidence"),
+                    },
+                }
+            )
+
+        return {
+            "standardId": standard_id,
+            "rootNodeId": report_node_id,
+            "maxDepth": 3,
+            "maxNodes": max(len(workbench_nodes), 1),
+            "isTruncated": False,
+            "nodes": workbench_nodes,
+            "edges": workbench_edges,
+        }
+
+    def _sort_key(self, ref: Any, fallback: str) -> tuple[int, str]:
+        if isinstance(ref, str) and ref.strip():
+            parts = [part for part in re.split(r"[.\-]", ref.strip()) if part]
+            if all(part.isdigit() for part in parts):
+                return (0, ".".join(f"{int(part):06d}" for part in parts))
+        return (1, fallback)
 
     def _find_node_by_identity(self, nodes: list[dict[str, Any]], node_id: str | None, entity_name: str | None) -> int | None:
         if node_id:

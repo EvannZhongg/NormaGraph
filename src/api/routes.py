@@ -6,6 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Query, Response, UploadFile, status
 
+from adapters.llm_client import ResponseAPIError
 from models.schemas import (
     ComparisonSummary,
     CreateComparisonRequest,
@@ -24,6 +25,10 @@ from models.schemas import (
     KgSpacesResponse,
     QuestionRequest,
     QuestionResponse,
+    ReportComparisonRequest,
+    ReportComparisonDetail,
+    ReportComparisonResponse,
+    ReportSpaceDetail,
     RequirementDetail,
     StandardDetail,
     StandardsResponse,
@@ -181,6 +186,46 @@ def build_router(ingestion_service: IngestionService) -> APIRouter:
     @router.get("/v1/documents/{document_id}/jobs", response_model=DocumentJobsResponse)
     async def get_document_jobs(document_id: str) -> DocumentJobsResponse:
         return DocumentJobsResponse(items=ingestion_service.list_document_jobs(document_id))
+
+    @router.get("/v1/report-spaces/{document_id}", response_model=ReportSpaceDetail)
+    async def get_report_space(document_id: str) -> ReportSpaceDetail:
+        try:
+            return ReportSpaceDetail(**ingestion_service.get_report_space_detail(document_id))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    @router.post("/v1/report-spaces/{document_id}/comparisons", response_model=ReportComparisonDetail, status_code=status.HTTP_202_ACCEPTED)
+    async def start_report_comparison(
+        document_id: str,
+        request: ReportComparisonRequest,
+        background_tasks: BackgroundTasks,
+    ) -> ReportComparisonDetail:
+        try:
+            return ReportComparisonDetail(**ingestion_service.start_report_comparison(document_id, request.standardId, background_tasks))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ResponseAPIError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    @router.get("/v1/report-spaces/{document_id}/comparisons/{standard_id}", response_model=ReportComparisonDetail)
+    async def get_report_comparison(document_id: str, standard_id: str) -> ReportComparisonDetail:
+        try:
+            return ReportComparisonDetail(**ingestion_service.get_report_comparison_detail(document_id, standard_id))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    @router.post("/v1/report-spaces/{document_id}/units/{unit_uid}/compare", response_model=ReportComparisonResponse)
+    async def compare_report_unit(document_id: str, unit_uid: str, request: ReportComparisonRequest) -> ReportComparisonResponse:
+        try:
+            return ReportComparisonResponse(**ingestion_service.compare_report_unit(document_id, unit_uid, request.standardId))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ResponseAPIError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     @router.post("/v1/documents/upload", response_model=IngestionJob, status_code=status.HTTP_202_ACCEPTED)
     async def upload_document(

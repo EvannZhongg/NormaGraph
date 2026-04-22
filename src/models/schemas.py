@@ -94,6 +94,91 @@ class DocumentJobsResponse(BaseModel):
     items: list[IngestionJob]
 
 
+class ReportSectionSummary(BaseModel):
+    sectionUid: str
+    parentSectionUid: str | None = None
+    title: str
+    sectionKind: str
+    path: list[str] = Field(default_factory=list)
+    orderIndex: int = 0
+    pageSpan: list[int] = Field(default_factory=list)
+    memberCount: int = 0
+
+
+class ReportUnitSummary(BaseModel):
+    unitUid: str
+    parentSectionUid: str | None = None
+    unitType: str
+    sectionPath: list[str] = Field(default_factory=list)
+    structuralPath: list[str] = Field(default_factory=list)
+    text: str
+    textNormalized: str
+    orderIndex: int = 0
+    pageSpan: list[int] = Field(default_factory=list)
+
+
+class ReportSpaceDetail(BaseModel):
+    documentId: str
+    reportSpaceDir: str
+    artifactDir: str | None = None
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    sections: list[ReportSectionSummary] = Field(default_factory=list)
+    reportUnits: list[ReportUnitSummary] = Field(default_factory=list)
+
+
+class ReportComparisonRequest(BaseModel):
+    standardId: str
+
+
+class ReportComparisonItem(BaseModel):
+    clauseId: str
+    clauseRef: str | None = None
+    sectionId: str | None = None
+    chapterId: str | None = None
+    label: str
+    status: Literal["covered", "partial", "missing", "violated", "not_applicable"]
+    reason: str
+    reportEvidence: str | None = None
+
+
+class ReportUnitComparisonResult(BaseModel):
+    documentId: str
+    reportUnitId: str
+    parentSectionUid: str | None = None
+    standardId: str
+    summary: str
+    coverageScore: float
+    chapterRoutingReasoning: str | None = None
+    sectionRoutingReasoning: str | None = None
+    matchedChapterIds: list[str] = Field(default_factory=list)
+    matchedSectionIds: list[str] = Field(default_factory=list)
+    items: list[ReportComparisonItem] = Field(default_factory=list)
+    graph: GraphWorkbenchResponse
+
+
+class ReportComparisonResponse(ReportUnitComparisonResult):
+    pass
+
+
+class ReportComparisonDetail(BaseModel):
+    documentId: str
+    standardId: str
+    status: JobStatus
+    progress: float = 0.0
+    totalUnits: int = 0
+    completedUnits: int = 0
+    startedAt: datetime | None = None
+    updatedAt: datetime | None = None
+    completedAt: datetime | None = None
+    summary: str = ""
+    coverageScore: float = 0.0
+    matchedChapterIds: list[str] = Field(default_factory=list)
+    matchedSectionIds: list[str] = Field(default_factory=list)
+    items: list[ReportComparisonItem] = Field(default_factory=list)
+    unitResults: list[ReportUnitComparisonResult] = Field(default_factory=list)
+    error: str | None = None
+
+
 class KgSpaceSummary(BaseModel):
     standardId: str
     code: str

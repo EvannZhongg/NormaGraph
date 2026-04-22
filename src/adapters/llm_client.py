@@ -14,6 +14,7 @@ from core.config import AppConfig
 logger = logging.getLogger(__name__)
 
 EMBEDDING_RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+LLM_RETRYABLE_STATUS_CODES = EMBEDDING_RETRYABLE_STATUS_CODES
 
 
 class ResponseAPIError(RuntimeError):
@@ -72,12 +73,39 @@ class ResponsesAPIClient:
         if self.config.llm.enable_thinking is not None:
             payload["enable_thinking"] = self.config.llm.enable_thinking
 
-        try:
-            with httpx.Client(timeout=self.config.llm.timeout_seconds) as client:
-                response = client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise ResponseAPIError(str(exc)) from exc
+        max_retries = max(0, self.config.llm.batch_max_retries)
+        max_attempts = max_retries + 1
+        response: httpx.Response | None = None
+        last_exc: httpx.HTTPError | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with httpx.Client(timeout=self.config.llm.timeout_seconds) as client:
+                    response = client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                if attempt > 1:
+                    logger.info(
+                        "LLM structured output request succeeded on retry attempt %s/%s.",
+                        attempt,
+                        max_attempts,
+                    )
+                break
+            except httpx.HTTPError as exc:
+                last_exc = exc
+                if attempt >= max_attempts or not self._is_retryable_llm_error(exc):
+                    raise ResponseAPIError(str(exc)) from exc
+                delay_seconds = self._llm_retry_delay_seconds(attempt)
+                logger.warning(
+                    "Retrying LLM structured output request after attempt %s/%s in %.1fs: %s",
+                    attempt,
+                    max_attempts,
+                    delay_seconds,
+                    exc,
+                )
+                if delay_seconds > 0:
+                    time.sleep(delay_seconds)
+
+        if response is None:
+            raise ResponseAPIError(str(last_exc) if last_exc else "LLM request ended without response.")
 
         try:
             data = response.json()
@@ -162,6 +190,12 @@ class ResponsesAPIClient:
         fenced = self._unwrap_markdown_code_block(raw_text)
         if fenced != raw_text:
             add(fenced)
+        repaired = self._repair_json_text(raw_text)
+        if repaired != raw_text:
+            add(repaired)
+            repaired_fenced = self._unwrap_markdown_code_block(repaired)
+            if repaired_fenced != repaired:
+                add(repaired_fenced)
 
         for source in list(candidates):
             for opening, closing in (("{", "}"), ("[", "]")):
@@ -169,6 +203,9 @@ class ResponsesAPIClient:
                 end = source.rfind(closing)
                 if 0 <= start < end:
                     add(source[start : end + 1])
+                    repaired_fragment = self._repair_json_text(source[start : end + 1])
+                    if repaired_fragment != source[start : end + 1]:
+                        add(repaired_fragment)
 
         return candidates
 
@@ -177,6 +214,67 @@ class ResponsesAPIClient:
         if not match:
             return text
         return match.group(1).strip()
+
+    def _repair_json_text(self, text: str) -> str:
+        repaired: list[str] = []
+        in_string = False
+        escape = False
+        index = 0
+
+        while index < len(text):
+            char = text[index]
+            if escape:
+                repaired.append(char)
+                escape = False
+                index += 1
+                continue
+
+            if char == "\\":
+                repaired.append(char)
+                escape = True
+                index += 1
+                continue
+
+            if char == '"':
+                if not in_string:
+                    in_string = True
+                    repaired.append(char)
+                    index += 1
+                    continue
+
+                next_significant = self._next_significant_char(text, index + 1)
+                if next_significant in {",", "}", "]", ":"}:
+                    in_string = False
+                    repaired.append(char)
+                else:
+                    repaired.append('\\"')
+                index += 1
+                continue
+
+            repaired.append(char)
+            index += 1
+
+        return "".join(repaired)
+
+    def _next_significant_char(self, text: str, start: int) -> str | None:
+        index = start
+        while index < len(text):
+            char = text[index]
+            if not char.isspace():
+                return char
+            index += 1
+        return None
+
+    def _llm_retry_delay_seconds(self, attempt_number: int) -> float:
+        base_delay = max(0.0, self.config.llm.batch_retry_backoff_seconds)
+        return base_delay * attempt_number
+
+    def _is_retryable_llm_error(self, exc: httpx.HTTPError) -> bool:
+        if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code in LLM_RETRYABLE_STATUS_CODES
+        return False
 
     def _extract_output_text(self, payload: dict[str, Any]) -> str:
         output_text = payload.get("output_text")
