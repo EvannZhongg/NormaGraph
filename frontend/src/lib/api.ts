@@ -83,9 +83,29 @@ export interface ReportComparisonItem {
   sectionId?: string | null
   chapterId?: string | null
   label: string
-  status: 'covered' | 'partial' | 'missing' | 'violated' | 'not_applicable'
+  status: 'covered' | 'violated'
   reason: string
   reportEvidence?: string | null
+}
+
+export interface ReportClauseEvidenceUnit {
+  reportUnitId: string
+  status: 'covered' | 'violated'
+  reason: string
+  reportEvidence?: string | null
+}
+
+export interface ReportClauseSummary {
+  clauseId: string
+  clauseRef?: string | null
+  sectionId?: string | null
+  chapterId?: string | null
+  label: string
+  finalStatus: 'covered' | 'violated' | 'missing'
+  coveredCount: number
+  violatedCount: number
+  hitCount: number
+  evidenceUnits: ReportClauseEvidenceUnit[]
 }
 
 export interface ReportUnitComparisonResult {
@@ -100,6 +120,8 @@ export interface ReportUnitComparisonResult {
   matchedChapterIds: string[]
   matchedSectionIds: string[]
   items: ReportComparisonItem[]
+  matchedClauses: ReportComparisonItem[]
+  exploredClauseIds: string[]
   graph: GraphWorkbenchData
 }
 
@@ -121,6 +143,7 @@ export interface ReportComparisonDetail {
   matchedChapterIds: string[]
   matchedSectionIds: string[]
   items: ReportComparisonItem[]
+  clauseSummaries: ReportClauseSummary[]
   unitResults: ReportUnitComparisonResult[]
   error?: string | null
 }
