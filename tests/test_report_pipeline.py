@@ -15,7 +15,8 @@ if str(SRC_DIR) not in sys.path:
 
 from core.config import get_config
 from services.report_pipeline import ReportPipelineService
-from services.report_outline_planner import ReportTitlePlanResult
+from adapters.llm_client import ResponseAPIError, ResponseAPIRequestError
+from services.report_outline_planner import ReportOutlinePlannerService, ReportTitlePlanResult
 
 
 class StubOutlinePlanner:
@@ -33,6 +34,29 @@ class StubOutlinePlanner:
                 'planner_failed_batch_count': 0,
             },
         )
+
+
+class StubLLMClient:
+    enabled = True
+
+    def __init__(self, payload: object) -> None:
+        self.payload = payload
+        self.call_count = 0
+
+    def create_structured_output(self, **kwargs: object) -> object:
+        self.call_count += 1
+        return self.payload
+
+
+class FailingRequestLLMClient:
+    enabled = True
+
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    def create_structured_output(self, **kwargs: object) -> object:
+        self.call_count += 1
+        raise ResponseAPIRequestError('LLM request failed after 2/2 attempts: timeout')
 
 
 class ReportPipelineStructureTest(unittest.TestCase):
@@ -82,12 +106,16 @@ class ReportPipelineStructureTest(unittest.TestCase):
         sections_by_title = {section['title']: section for section in output.sections}
 
         self.assertEqual(sections_by_title['1 引言']['section_kind'], 'chapter')
-        self.assertEqual(sections_by_title['1.1 工作基础']['section_kind'], 'section')
-        self.assertEqual(sections_by_title['1 基础资料收集']['section_kind'], 'topic')
-        self.assertEqual(sections_by_title['2 现场安全检查']['section_kind'], 'topic')
         self.assertEqual(sections_by_title['2 工程概况']['section_kind'], 'chapter')
-        self.assertEqual(sections_by_title['2.1 工程基本情况']['section_kind'], 'section')
-        self.assertEqual(sections_by_title['1 基础资料收集']['parent_section_uid'], sections_by_title['1.1 工作基础']['section_uid'])
+        self.assertNotIn('1.1 工作基础', sections_by_title)
+        self.assertNotIn('1 基础资料收集', sections_by_title)
+        self.assertNotIn('2 现场安全检查', sections_by_title)
+        self.assertNotIn('2.1 工程基本情况', sections_by_title)
+        units_by_title = {unit['title']: unit for unit in output.report_units if unit.get('title')}
+        self.assertIn('1.1 工作基础', units_by_title)
+        self.assertIn('2.1 工程基本情况', units_by_title)
+        self.assertEqual(units_by_title['1.1 工作基础']['parent_section_uid'], sections_by_title['1 引言']['section_uid'])
+        self.assertEqual(units_by_title['2.1 工程基本情况']['parent_section_uid'], sections_by_title['2 工程概况']['section_uid'])
 
         self.assertEqual(len(output.tables), 1)
         self.assertEqual(output.tables[0]['table_ref'], '2.1-1')
@@ -102,6 +130,8 @@ class ReportPipelineStructureTest(unittest.TestCase):
         self.assertIn(r'\(H_0 = H\)', combined_unit_text)
         self.assertIn(r'\[Q = m \varepsilon B \sigma_{s} \sqrt{2g} \cdot H_{0}^{3/2}\]', combined_unit_text)
         self.assertEqual(output.metrics['title_plan_source'], 'llm')
+        self.assertEqual(output.metrics['title_plan_llm_item_count'], 7)
+        self.assertEqual(output.metrics['title_plan_heuristic_item_count'], 0)
         self.assertEqual(len(output.title_inventory), 7)
         self.assertEqual(output.title_plan[0]['title_id'], output.title_inventory[0]['title_id'])
 
@@ -112,13 +142,11 @@ class ReportPipelineStructureTest(unittest.TestCase):
             items=[
                 {
                     'title_id': 'p002-b004',
-                    'role': 'section',
-                    'section_kind': 'section',
+                    'role': 'unit',
+                    'section_kind': 'unit',
                     'hierarchy_level': 2,
-                    'is_structural': True,
+                    'is_structural': False,
                     'ref': '1',
-                    'confidence': 0.95,
-                    'rationale': '在这个测试中把局部标题提升为结构节。',
                     'planner_source': 'llm',
                 }
             ]
@@ -127,11 +155,138 @@ class ReportPipelineStructureTest(unittest.TestCase):
         output = service.run(self.artifact_dir, 'report-doc')
 
         sections_by_title = {section['title']: section for section in output.sections}
-        self.assertEqual(sections_by_title['1 基础资料收集']['section_kind'], 'section')
+        self.assertNotIn('1 基础资料收集', sections_by_title)
         self.assertEqual(output.metrics['title_plan_source'], 'llm')
+        self.assertEqual(output.metrics['title_plan_llm_item_count'], 1)
+        self.assertEqual(output.metrics['title_plan_heuristic_item_count'], 0)
+        self.assertEqual(output.metrics['title_plan_missing_item_count'], 6)
         planned_item = next(item for item in output.title_plan if item['title_id'] == 'p002-b004')
         self.assertEqual(planned_item['planner_source'], 'llm')
-        self.assertEqual(planned_item['section_kind'], 'section')
+        self.assertEqual(planned_item['section_kind'], 'unit')
+        self.assertTrue(any(unit.get('title') == '1 基础资料收集' for unit in output.report_units))
+
+    def test_partial_llm_title_plan_leaves_missing_titles_unplanned(self) -> None:
+        content = [
+            [
+                self._title('1 工程概况'),
+                self._paragraph('工程概况正文。'),
+                self._title('1.1 建设过程'),
+                self._paragraph('建设过程正文。'),
+                self._title('2 现场安全检查'),
+                self._paragraph('现场检查正文。'),
+                self._title('2.1 检查结果'),
+                self._paragraph('检查结果正文。'),
+            ]
+        ]
+        (self.artifact_dir / 'content_list_v2.json').write_text(json.dumps(content, ensure_ascii=False), encoding='utf-8')
+
+        config = get_config().model_copy(deep=True)
+        config.llm.enabled = False
+        service = ReportPipelineService(
+            config=config,
+            outline_planner=StubOutlinePlanner(
+                [
+                    {
+                        'title_id': 'p001-b001',
+                        'role': 'chapter',
+                        'section_kind': 'chapter',
+                        'hierarchy_level': 1,
+                        'is_structural': True,
+                        'ref': '1',
+                    }
+                ]
+            ),
+        )
+        output = service.run(self.artifact_dir, 'report-doc')
+
+        sections_by_title = {section['title']: section for section in output.sections}
+
+        self.assertEqual(len(output.title_inventory), 4)
+        self.assertEqual(len(output.title_plan), 1)
+        self.assertEqual(output.metrics['title_plan_source'], 'llm')
+        self.assertEqual(output.metrics['title_plan_llm_item_count'], 1)
+        self.assertEqual(output.metrics['title_plan_heuristic_item_count'], 0)
+        self.assertEqual(output.metrics['title_plan_missing_item_count'], 3)
+        self.assertEqual(sections_by_title['1 工程概况']['title_planner_source'], 'llm')
+        self.assertNotIn('2 现场安全检查', sections_by_title)
+        self.assertNotIn('1.1 建设过程', sections_by_title)
+        self.assertNotIn('2.1 检查结果', sections_by_title)
+        combined_text = '\n'.join(unit['text_normalized'] for unit in output.report_units)
+        self.assertIn('1.1 建设过程', combined_text)
+        self.assertIn('2 现场安全检查', combined_text)
+
+    def test_title_planner_fails_fast_on_incomplete_llm_output(self) -> None:
+        config = get_config().model_copy(deep=True)
+        config.llm.enabled = True
+        config.llm.api_key = 'test-key'
+        planner = ReportOutlinePlannerService(config=config, client=StubLLMClient({'items': [], 'warnings': []}))
+
+        titles = [
+            {'title_id': 'p001-b001', 'title_index': 1, 'page_idx': 1, 'page_role': 'body', 'text': '1 工程概况'},
+            {'title_id': 'p001-b002', 'title_index': 2, 'page_idx': 1, 'page_role': 'body', 'text': '1.1 基本情况'},
+        ]
+
+        with self.assertRaises(ResponseAPIError):
+            planner.plan_titles('report-doc', titles)
+
+    def test_title_planner_stops_immediately_on_request_retry_exhaustion(self) -> None:
+        config = get_config().model_copy(deep=True)
+        config.llm.enabled = True
+        config.llm.api_key = 'test-key'
+        client = FailingRequestLLMClient()
+        planner = ReportOutlinePlannerService(config=config, client=client)
+
+        titles = [
+            {'title_id': f'p001-b{index:03d}', 'title_index': index, 'page_idx': 1, 'page_role': 'body', 'text': f'{index} 标题'}
+            for index in range(1, 25)
+        ]
+
+        with self.assertRaises(ResponseAPIRequestError):
+            planner.plan_titles('report-doc', titles)
+        self.assertEqual(client.call_count, 1)
+
+    def test_title_planner_accepts_compact_role_mapping_output(self) -> None:
+        config = get_config().model_copy(deep=True)
+        config.llm.enabled = True
+        config.llm.api_key = 'test-key'
+        planner = ReportOutlinePlannerService(
+            config=config,
+            client=StubLLMClient({'p001-b001': 'chapter', 'p001-b002': 'unit'}),
+        )
+
+        titles = [
+            {'title_id': 'p001-b001', 'title_index': 1, 'page_idx': 1, 'page_role': 'body', 'text': '1 工程概况'},
+            {'title_id': 'p001-b002', 'title_index': 2, 'page_idx': 1, 'page_role': 'body', 'text': '1.1 基本情况'},
+        ]
+
+        result = planner.plan_titles('report-doc', titles)
+
+        self.assertEqual([item['section_kind'] for item in result.items], ['chapter', 'unit'])
+
+    def test_title_planner_accepts_title_plan_list_output(self) -> None:
+        config = get_config().model_copy(deep=True)
+        config.llm.enabled = True
+        config.llm.api_key = 'test-key'
+        planner = ReportOutlinePlannerService(
+            config=config,
+            client=StubLLMClient(
+                {
+                    'title_plan': [
+                        {'title_id': 'p001-b001', 'role': 'chapter', 'ref': '1'},
+                        {'title_id': 'p001-b002', 'role': 'unit', 'ref': '1.1'},
+                    ]
+                }
+            ),
+        )
+
+        titles = [
+            {'title_id': 'p001-b001', 'title_index': 1, 'page_idx': 1, 'page_role': 'body', 'text': '1 工程概况'},
+            {'title_id': 'p001-b002', 'title_index': 2, 'page_idx': 1, 'page_role': 'body', 'text': '1.1 基本情况'},
+        ]
+
+        result = planner.plan_titles('report-doc', titles)
+
+        self.assertEqual([item['section_kind'] for item in result.items], ['chapter', 'unit'])
 
     def test_pipeline_accepts_prefixed_content_list_v2_file(self) -> None:
         content_list_path = self.artifact_dir / 'content_list_v2.json'
@@ -146,8 +301,8 @@ class ReportPipelineStructureTest(unittest.TestCase):
                 [
                     {
                         'title_id': 'p001-b001',
-                        'role': 'front_matter',
-                        'section_kind': 'front_matter',
+                        'role': 'chapter',
+                        'section_kind': 'chapter',
                         'hierarchy_level': 1,
                         'is_structural': False,
                         'ref': None,
@@ -159,6 +314,7 @@ class ReportPipelineStructureTest(unittest.TestCase):
 
         self.assertGreater(output.metrics['normalized_block_count'], 0)
         self.assertEqual(output.sections[0]['title'], '内容提要')
+        self.assertIn('本报告对工程安全情况进行综合评价。', output.report_units[0]['text_normalized'])
 
     def test_text_units_merge_continuous_text_until_section_or_non_text_boundary(self) -> None:
         content = [
@@ -195,18 +351,18 @@ class ReportPipelineStructureTest(unittest.TestCase):
                     },
                     {
                         'title_id': 'p001-b002',
-                        'role': 'section',
-                        'section_kind': 'section',
+                        'role': 'unit',
+                        'section_kind': 'unit',
                         'hierarchy_level': 2,
-                        'is_structural': True,
+                        'is_structural': False,
                         'ref': '1.1',
                     },
                     {
                         'title_id': 'p002-b004',
-                        'role': 'section',
-                        'section_kind': 'section',
+                        'role': 'unit',
+                        'section_kind': 'unit',
                         'hierarchy_level': 2,
-                        'is_structural': True,
+                        'is_structural': False,
                         'ref': '1.2',
                     },
                 ]
@@ -214,18 +370,17 @@ class ReportPipelineStructureTest(unittest.TestCase):
         )
         output = service.run(self.artifact_dir, 'report-doc')
 
-        design_section = next(section for section in output.sections if section['title'] == '1.1 工程设计及审批过程')
-        design_units = [unit for unit in output.report_units if unit['parent_section_uid'] == design_section['section_uid']]
+        design_unit = next(unit for unit in output.report_units if unit.get('title') == '1.1 工程设计及审批过程')
 
-        self.assertEqual(len(design_units), 1)
-        self.assertEqual(design_units[0]['source_page_span'], [1, 2])
+        self.assertEqual(design_unit['parent_section_uid'], output.sections[0]['section_uid'])
+        self.assertEqual(design_unit['source_page_span'], [1, 2])
         self.assertEqual(
-            design_units[0]['source_block_ids'],
-            ['p001-b003', 'p001-b004', 'p001-b005', 'p002-b001', 'p002-b002', 'p002-b003'],
+            design_unit['source_block_ids'],
+            ['p001-b002', 'p001-b003', 'p001-b004', 'p001-b005', 'p002-b001', 'p002-b002', 'p002-b003'],
         )
-        self.assertIn('第六段审批过程。', design_units[0]['text_normalized'])
+        self.assertIn('第六段审批过程。', design_unit['text_normalized'])
 
-    def test_unplanned_titles_are_kept_in_current_unit_instead_of_heuristic_sections(self) -> None:
+    def test_toc_titles_are_kept_in_current_unit_when_planner_marks_only_toc(self) -> None:
         content = [
             [
                 self._title('目录'),
@@ -257,8 +412,8 @@ class ReportPipelineStructureTest(unittest.TestCase):
         output = service.run(self.artifact_dir, 'report-doc')
 
         self.assertEqual([section['title'] for section in output.sections], ['目录'])
-        self.assertEqual(len(output.report_units), 2)
-        self.assertEqual(output.report_units[0]['source_block_ids'], ['p001-b002', 'p001-b003-i001', 'p001-b003-i002'])
+        self.assertEqual(len(output.report_units), 1)
+        self.assertEqual(output.report_units[0]['source_block_ids'], ['p001-b002', 'p001-b003-i001', 'p001-b003-i002', 'p001-b004', 'p001-b005-i001'])
         self.assertIn('1 基本情况 …… 1', output.report_units[0]['text_normalized'])
         self.assertIn('1.2 工程设计及建设过程 ..... 2', output.report_units[0]['text_normalized'])
 
@@ -339,9 +494,9 @@ class ReportPipelineStructureTest(unittest.TestCase):
         return [
             {
                 'title_id': 'p001-b001',
-                'role': 'front_matter',
-                'section_kind': 'front_matter',
-                'hierarchy_level': 1,
+                'role': 'ignore',
+                'section_kind': 'ignore',
+                'hierarchy_level': 0,
                 'is_structural': False,
                 'ref': None,
             },
@@ -355,25 +510,25 @@ class ReportPipelineStructureTest(unittest.TestCase):
             },
             {
                 'title_id': 'p002-b002',
-                'role': 'section',
-                'section_kind': 'section',
+                'role': 'unit',
+                'section_kind': 'unit',
                 'hierarchy_level': 2,
-                'is_structural': True,
+                'is_structural': False,
                 'ref': '1.1',
             },
             {
                 'title_id': 'p002-b004',
-                'role': 'topic',
-                'section_kind': 'topic',
-                'hierarchy_level': 4,
+                'role': 'ignore',
+                'section_kind': 'ignore',
+                'hierarchy_level': 0,
                 'is_structural': False,
                 'ref': '1',
             },
             {
                 'title_id': 'p002-b006',
-                'role': 'topic',
-                'section_kind': 'topic',
-                'hierarchy_level': 4,
+                'role': 'ignore',
+                'section_kind': 'ignore',
+                'hierarchy_level': 0,
                 'is_structural': False,
                 'ref': '2',
             },
@@ -387,10 +542,10 @@ class ReportPipelineStructureTest(unittest.TestCase):
             },
             {
                 'title_id': 'p002-b010',
-                'role': 'section',
-                'section_kind': 'section',
+                'role': 'unit',
+                'section_kind': 'unit',
                 'hierarchy_level': 2,
-                'is_structural': True,
+                'is_structural': False,
                 'ref': '2.1',
             },
         ]

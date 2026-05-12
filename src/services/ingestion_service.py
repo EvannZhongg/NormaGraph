@@ -178,8 +178,11 @@ class IngestionService:
         if not evaluation_units:
             raise FileNotFoundError(f"Report {document_id} does not contain evaluation units for comparison.")
 
-        existing = self._load_report_comparison(document_id, standard_id)
-        if existing and existing.get("status") in {"queued", "running", "succeeded"}:
+        try:
+            existing = self._load_report_comparison(document_id, standard_id)
+        except ValueError:
+            existing = None
+        if existing and existing.get("status") in {"queued", "running"}:
             return existing
 
         now = datetime.now(UTC)
@@ -199,6 +202,7 @@ class IngestionService:
             "matchedChapterIds": [],
             "matchedSectionIds": [],
             "items": [],
+            "clauseSummaries": [],
             "unitResults": [],
             "error": None,
         }
@@ -282,6 +286,7 @@ class IngestionService:
             detail["completedUnits"] = 0
             detail["unitResults"] = []
             detail["items"] = []
+            detail["clauseSummaries"] = []
             detail["error"] = None
             detail["updatedAt"] = datetime.now(UTC)
             self._save_report_comparison(document_id, standard_id, detail)
@@ -383,6 +388,7 @@ class IngestionService:
             detail["matchedChapterIds"] = aggregate["matchedChapterIds"]
             detail["matchedSectionIds"] = aggregate["matchedSectionIds"]
             detail["items"] = aggregate["items"]
+            detail["clauseSummaries"] = aggregate["clauseSummaries"]
             detail["error"] = (
                 f"{failed_unit_count} report unit(s) failed during evaluation."
                 if failed_unit_count and failed_unit_count >= len(unit_results)
@@ -1473,6 +1479,8 @@ class IngestionService:
             "matchedChapterIds": agent_result["chapter_ids"],
             "matchedSectionIds": agent_result["section_ids"],
             "items": items,
+            "matchedClauses": items,
+            "exploredClauseIds": agent_result.get("explored_clause_ids") or [],
             "graph": graph,
         }
 
@@ -1482,7 +1490,7 @@ class IngestionService:
         clause_candidates: list[dict[str, Any]],
     ) -> dict[str, Any]:
         clause_info_by_id = {item["id"]: item for item in clause_candidates if item.get("id")}
-        items_by_clause: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        evidence_by_clause: dict[str, list[dict[str, Any]]] = defaultdict(list)
         matched_chapter_ids: set[str] = set()
         matched_section_ids: set[str] = set()
         for unit_result in unit_results:
@@ -1490,75 +1498,106 @@ class IngestionService:
             matched_section_ids.update(str(item) for item in unit_result.get("matchedSectionIds") or [])
             for item in unit_result.get("items") or []:
                 clause_id = str(item.get("clauseId") or "")
-                if clause_id:
-                    items_by_clause[clause_id].append(item)
+                status = str(item.get("status") or "")
+                if clause_id in clause_info_by_id and status in {"covered", "violated"}:
+                    evidence_by_clause[clause_id].append(
+                        {
+                            **item,
+                            "reportUnitId": str(unit_result.get("reportUnitId") or ""),
+                        }
+                    )
 
-        aggregated_items: list[dict[str, Any]] = []
-        for clause_id in sorted(items_by_clause, key=lambda value: self._sort_key(clause_info_by_id.get(value, {}).get("clause_ref"), value)):
+        clause_summaries: list[dict[str, Any]] = []
+        for clause_id in sorted(clause_info_by_id, key=lambda value: self._sort_key(clause_info_by_id.get(value, {}).get("clause_ref"), value)):
             clause_info = clause_info_by_id.get(clause_id, {})
-            clause_items = items_by_clause[clause_id]
-            status = self._aggregate_item_status(clause_items)
-            reasons = [str(item.get("reason") or "").strip() for item in clause_items if str(item.get("reason") or "").strip()]
-            evidences = [str(item.get("reportEvidence") or "").strip() for item in clause_items if str(item.get("reportEvidence") or "").strip()]
-            aggregated_items.append(
+            evidence_items = evidence_by_clause.get(clause_id, [])
+            covered_count = sum(1 for item in evidence_items if item.get("status") == "covered")
+            violated_count = sum(1 for item in evidence_items if item.get("status") == "violated")
+            if violated_count > 0:
+                final_status = "violated"
+            elif covered_count > 0:
+                final_status = "covered"
+            else:
+                final_status = "missing"
+            clause_summaries.append(
                 {
                     "clauseId": clause_id,
                     "clauseRef": clause_info.get("clause_ref"),
                     "sectionId": clause_info.get("section_id"),
                     "chapterId": clause_info.get("chapter_id"),
                     "label": clause_info.get("label") or clause_id,
-                    "status": status,
-                    "reason": " | ".join(dict.fromkeys(reasons))[:2000],
-                    "reportEvidence": evidences[0] if evidences else None,
+                    "finalStatus": final_status,
+                    "coveredCount": covered_count,
+                    "violatedCount": violated_count,
+                    "hitCount": covered_count + violated_count,
+                    "evidenceUnits": [
+                        {
+                            "reportUnitId": item["reportUnitId"],
+                            "status": item["status"],
+                            "reason": str(item.get("reason") or ""),
+                            "reportEvidence": item.get("reportEvidence"),
+                        }
+                        for item in evidence_items
+                    ],
                 }
             )
 
-        coverage_score = self._compute_report_coverage_score(aggregated_items)
+        aggregated_items = self._items_from_clause_summaries(clause_summaries)
+        coverage_score = self._compute_report_coverage_score(clause_summaries)
         failed_unit_count = sum(1 for item in unit_results if item.get("error"))
-        summary = self._build_report_comparison_summary(aggregated_items, failed_unit_count=failed_unit_count)
+        summary = self._build_report_comparison_summary(clause_summaries, failed_unit_count=failed_unit_count)
         return {
             "summary": summary,
             "coverageScore": coverage_score,
             "matchedChapterIds": sorted(matched_chapter_ids),
             "matchedSectionIds": sorted(matched_section_ids),
             "items": aggregated_items,
+            "clauseSummaries": clause_summaries,
         }
 
-    def _aggregate_item_status(self, items: list[dict[str, Any]]) -> str:
-        statuses = {str(item.get("status") or "") for item in items}
-        if "violated" in statuses:
-            return "violated"
-        if "covered" in statuses:
-            return "covered"
-        if "partial" in statuses:
-            return "partial"
-        if "missing" in statuses:
-            return "missing"
-        return "not_applicable"
-
     def _compute_report_coverage_score(self, items: list[dict[str, Any]]) -> float:
-        applicable_items = [item for item in items if item.get("status") != "not_applicable"]
-        if not applicable_items:
+        if not items:
             return 0.0
-        score = 0.0
-        for item in applicable_items:
-            status = item.get("status")
-            if status == "covered":
-                score += 1.0
-            elif status == "partial":
-                score += 0.5
-        return round(score / len(applicable_items), 4)
+        covered_count = sum(1 for item in items if item.get("finalStatus") == "covered")
+        return round(covered_count / len(items), 4)
 
     def _build_report_comparison_summary(self, items: list[dict[str, Any]], failed_unit_count: int = 0) -> str:
-        counts = Counter(str(item.get("status") or "") for item in items)
+        counts = Counter(str(item.get("finalStatus") or "") for item in items)
         summary = (
-            f"covered={counts.get('covered', 0)}, partial={counts.get('partial', 0)}, "
-            f"missing={counts.get('missing', 0)}, violated={counts.get('violated', 0)}, "
-            f"not_applicable={counts.get('not_applicable', 0)}"
+            f"clauses={len(items)}, covered={counts.get('covered', 0)}, "
+            f"violated={counts.get('violated', 0)}, missing={counts.get('missing', 0)}"
         )
         if failed_unit_count > 0:
             summary += f", failed_units={failed_unit_count}"
         return summary
+
+    def _items_from_clause_summaries(self, clause_summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for summary in clause_summaries:
+            if summary.get("finalStatus") == "missing":
+                continue
+            evidence_units = [
+                item
+                for item in summary.get("evidenceUnits") or []
+                if item.get("status") == summary.get("finalStatus")
+            ]
+            if not evidence_units:
+                evidence_units = list(summary.get("evidenceUnits") or [])
+            reasons = [str(item.get("reason") or "").strip() for item in evidence_units if str(item.get("reason") or "").strip()]
+            evidences = [str(item.get("reportEvidence") or "").strip() for item in evidence_units if str(item.get("reportEvidence") or "").strip()]
+            items.append(
+                {
+                    "clauseId": summary["clauseId"],
+                    "clauseRef": summary.get("clauseRef"),
+                    "sectionId": summary.get("sectionId"),
+                    "chapterId": summary.get("chapterId"),
+                    "label": summary.get("label") or summary["clauseId"],
+                    "status": summary["finalStatus"],
+                    "reason": " | ".join(dict.fromkeys(reasons))[:2000],
+                    "reportEvidence": evidences[0] if evidences else None,
+                }
+            )
+        return items
 
     def _build_failed_report_unit_result(
         self,
@@ -1588,6 +1627,8 @@ class IngestionService:
             "matchedChapterIds": [str(item) for item in (matched_chapter_ids or []) if str(item)],
             "matchedSectionIds": [str(item) for item in (matched_section_ids or []) if str(item)],
             "items": [],
+            "matchedClauses": [],
+            "exploredClauseIds": [],
             "graph": self._build_report_comparison_graph(
                 document_id=document_id,
                 report_unit=report_unit,
@@ -1715,7 +1756,7 @@ class IngestionService:
         selected_clause_ids = [
             item["clauseId"]
             for item in comparison_items
-            if item["status"] in {"covered", "partial", "missing", "violated"}
+            if item["status"] in {"covered", "violated"}
         ]
         included_ids: set[str] = {standard_id, *matched_chapter_ids, *matched_section_ids, *selected_clause_ids}
         for clause_id in list(selected_clause_ids):
@@ -1757,7 +1798,7 @@ class IngestionService:
             if str(edge.get("source_uid") or "") in included_ids and str(edge.get("target_uid") or "") in included_ids
         ]
         for index, item in enumerate(comparison_items, start=1):
-            if item["status"] not in {"covered", "partial", "missing", "violated"}:
+            if item["status"] not in {"covered", "violated"}:
                 continue
             workbench_edges.append(
                 {

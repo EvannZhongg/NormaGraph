@@ -14,30 +14,19 @@
           "role": {
             "type": "string",
             "enum": [
-              "front_matter",
               "toc",
               "chapter",
+              "unit",
+              "appendix",
+              "ignore",
+              "front_matter",
               "section",
               "subsection",
               "topic",
-              "subtopic",
-              "appendix",
-              "ignore"
+              "subtopic"
             ]
           },
           "ref": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "confidence": {
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "rationale": {
             "type": [
               "string",
               "null"
@@ -47,9 +36,7 @@
         "required": [
           "title_id",
           "role",
-          "ref",
-          "confidence",
-          "rationale"
+          "ref"
         ]
       }
     },

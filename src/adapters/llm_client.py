@@ -21,6 +21,23 @@ class ResponseAPIError(RuntimeError):
     pass
 
 
+class ResponseAPIRequestError(ResponseAPIError):
+    pass
+
+
+class ResponseAPIOutputError(ResponseAPIError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_text: str | None = None,
+        payload: Any | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.raw_text = raw_text
+        self.payload = payload
+
+
 class ResponsesAPIClient:
     _MARKDOWN_CODE_BLOCK_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
 
@@ -110,7 +127,9 @@ class ResponsesAPIClient:
             except httpx.HTTPError as exc:
                 last_exc = exc
                 if attempt >= max_attempts or not self._is_retryable_llm_error(exc):
-                    raise ResponseAPIError(str(exc)) from exc
+                    raise ResponseAPIRequestError(
+                        f"LLM request failed after {attempt}/{max_attempts} attempts: {exc}"
+                    ) from exc
                 delay_seconds = self._llm_retry_delay_seconds(attempt)
                 logger.warning(
                     "Retrying LLM structured output request after attempt %s/%s in %.1fs: %s",
@@ -123,12 +142,14 @@ class ResponsesAPIClient:
                     time.sleep(delay_seconds)
 
         if response is None:
-            raise ResponseAPIError(str(last_exc) if last_exc else "LLM request ended without response.")
+            raise ResponseAPIRequestError(
+                str(last_exc) if last_exc else "LLM request ended without response."
+            )
 
         try:
             data = response.json()
         except ValueError as exc:
-            raise ResponseAPIError("Responses API did not return valid JSON.") from exc
+            raise ResponseAPIRequestError("Responses API did not return valid JSON.") from exc
         self._raise_for_response_status(data)
         return data
 
@@ -178,7 +199,7 @@ class ResponsesAPIClient:
         message = error.get("message")
         if message:
             details.append(f"message={message}")
-        raise ResponseAPIError("Responses API returned non-success status: " + " | ".join(details))
+        raise ResponseAPIRequestError("Responses API returned non-success status: " + " | ".join(details))
 
     def _parse_json_output(self, raw_text: str) -> Any:
         last_exc: json.JSONDecodeError | None = None
@@ -189,7 +210,10 @@ class ResponsesAPIClient:
                 last_exc = exc
 
         logger.error("Failed to parse structured output text after sanitation: %s", raw_text)
-        raise ResponseAPIError("Responses API did not return valid JSON text.") from last_exc
+        raise ResponseAPIOutputError(
+            "Responses API did not return valid JSON text.",
+            raw_text=raw_text,
+        ) from last_exc
 
     def _json_text_candidates(self, raw_text: str) -> list[str]:
         candidates: list[str] = []
@@ -312,7 +336,10 @@ class ResponsesAPIClient:
                         text_parts.append(nested)
         if text_parts:
             return "\n".join(text_parts)
-        raise ResponseAPIError("Responses API response did not contain output_text.")
+        raise ResponseAPIOutputError(
+            "Responses API response did not contain output_text.",
+            payload=payload,
+        )
 
 
 class EmbeddingsAPIClient:

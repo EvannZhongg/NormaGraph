@@ -17,12 +17,12 @@ from services.report_comparison_agent import ReportComparisonAgentService, build
 
 
 class StubReportComparisonClient:
-    def __init__(self, payloads: list[dict]) -> None:
+    def __init__(self, payloads: list[object]) -> None:
         self.payloads = payloads
         self.calls = 0
         self.enabled = True
 
-    def create_structured_output(self, **kwargs) -> dict:
+    def create_structured_output(self, **kwargs) -> object:
         del kwargs
         payload = self.payloads[min(self.calls, len(self.payloads) - 1)]
         self.calls += 1
@@ -41,9 +41,8 @@ class StubViolatedSummaryTextFallbackClient:
         self.structured_calls += 1
         if self.structured_calls == 1:
             return {
-                "summary": "covered=0, partial=0, missing=0, violated=1, not_applicable=0",
-                "coverage_score": 0.0,
-                "items": [
+                "summary": "matched covered=0, violated=1",
+                "matched_items": [
                     {
                         "clause_id": "sl258:2017:main:6.2.1",
                         "status": "violated",
@@ -51,6 +50,7 @@ class StubViolatedSummaryTextFallbackClient:
                         "reason": "与条款要求冲突。",
                     }
                 ],
+                "explored_clause_ids": ["sl258:2017:main:6.2.1"],
             }
         raise ResponseAPIError("Responses API did not return valid JSON text.")
 
@@ -71,9 +71,8 @@ class StubViolatedSummaryImmediateFallbackRetryClient:
         self.structured_calls += 1
         if self.structured_calls == 1:
             return {
-                "summary": "covered=0, partial=0, missing=0, violated=1, not_applicable=0",
-                "coverage_score": 0.0,
-                "items": [
+                "summary": "matched covered=0, violated=1",
+                "matched_items": [
                     {
                         "clause_id": "sl258:2017:main:6.2.1",
                         "status": "violated",
@@ -81,6 +80,7 @@ class StubViolatedSummaryImmediateFallbackRetryClient:
                         "reason": "与条款要求冲突。",
                     }
                 ],
+                "explored_clause_ids": ["sl258:2017:main:6.2.1"],
             }
         raise ResponseAPIError("Responses API did not return valid JSON text.")
 
@@ -93,6 +93,38 @@ class StubViolatedSummaryImmediateFallbackRetryClient:
 
 
 class ReportComparisonAgentTest(unittest.TestCase):
+    def test_routing_accepts_list_payloads_from_llm(self) -> None:
+        config = get_config().model_copy(deep=True)
+        config.llm.batch_max_retries = 0
+        client = StubReportComparisonClient(
+            [
+                ["sl258:2017:chapter:6"],
+                [{"section_id": "sl258:2017:section:6.2"}],
+            ]
+        )
+        service = ReportComparisonAgentService(config=config, client=client)
+
+        result = service.route_report_scope(
+            report_scope={
+                "scope_uid": "report:doc:section:6",
+                "title": "5 运行管理评价",
+                "text": "报告提到了管理机构、划界确权和监测资料整编。",
+            },
+            standard_id="sl258:2017",
+            chapter_candidates=[
+                {"id": "sl258:2017:chapter:6", "title": "运行管理评价", "ref": "6"},
+                {"id": "sl258:2017:chapter:7", "title": "防洪能力复核", "ref": "7"},
+            ],
+            section_candidates=[
+                {"id": "sl258:2017:section:6.2", "chapter_id": "sl258:2017:chapter:6", "title": "运行管理", "ref": "6.2"},
+                {"id": "sl258:2017:section:7.2", "chapter_id": "sl258:2017:chapter:7", "title": "防洪标准", "ref": "7.2"},
+            ],
+        )
+
+        self.assertEqual(result["chapter_ids"], ["sl258:2017:chapter:6"])
+        self.assertEqual(result["section_ids"], ["sl258:2017:section:6.2"])
+        self.assertEqual(client.calls, 2)
+
     def test_table_prompt_uses_html_only(self) -> None:
         prompt = build_report_clause_assessment_prompt(
             report_unit={
@@ -111,21 +143,21 @@ class ReportComparisonAgentTest(unittest.TestCase):
         payload = json.loads(prompt)
         self.assertEqual(payload["report_unit"]["text"], "<table><tr><td>项目</td><td>数值</td></tr></table>")
 
-    def test_assessment_accepts_coverage_status_alias(self) -> None:
+    def test_discovery_accepts_coverage_status_alias_for_matched_clause(self) -> None:
         config = get_config().model_copy(deep=True)
         config.llm.batch_max_retries = 0
         client = StubReportComparisonClient(
             [
                 {
-                    "evaluation_results": [
+                    "matched_items": [
                         {
                             "clause_id": "sl258:2017:main:6.2.1",
-                            "coverage_status": "partial",
+                            "coverage_status": "covered",
                             "report_evidence": "报告提到了管理机构和人员不足。",
-                            "reason": "部分覆盖。",
+                            "reason": "明确覆盖。",
                         }
                     ],
-                    "coverage_score": 0.5,
+                    "explored_clause_ids": ["sl258:2017:main:6.2.1"],
                 }
             ]
         )
@@ -148,26 +180,28 @@ class ReportComparisonAgentTest(unittest.TestCase):
         )
 
         self.assertEqual(len(result["items"]), 1)
-        self.assertEqual(result["items"][0]["status"], "partial")
+        self.assertEqual(result["items"][0]["status"], "covered")
+        self.assertEqual(result["matched_clauses"], result["items"])
+        self.assertEqual(result["explored_clause_ids"], ["sl258:2017:main:6.2.1"])
         self.assertEqual(client.calls, 1)
 
-    def test_assessment_retries_on_incompatible_payload_and_then_recovers(self) -> None:
+    def test_discovery_drops_incompatible_status_without_retrying_unit(self) -> None:
         config = get_config().model_copy(deep=True)
-        config.llm.batch_max_retries = 2
+        config.llm.batch_max_retries = 0
         config.llm.batch_retry_backoff_seconds = 0.0
         client = StubReportComparisonClient(
             [
-                {"evaluation_results": [{"clause_id": "sl258:2017:main:6.2.1", "bad_status": "partial"}], "coverage_score": 0.0},
                 {
-                    "evaluation_results": [
+                    "matched_items": [
+                        {"clause_id": "sl258:2017:main:6.2.1", "status": "partial", "reason": "弱相关", "report_evidence": None},
                         {
                             "clause_id": "sl258:2017:main:6.2.1",
                             "status": "covered",
                             "report_evidence": "报告已覆盖。",
                             "reason": "覆盖。",
-                        }
+                        },
                     ],
-                    "coverage_score": 1.0,
+                    "explored_clause_ids": ["sl258:2017:main:6.2.1"],
                 },
             ]
         )
@@ -190,7 +224,7 @@ class ReportComparisonAgentTest(unittest.TestCase):
         )
 
         self.assertEqual(result["items"][0]["status"], "covered")
-        self.assertEqual(client.calls, 2)
+        self.assertEqual(client.calls, 1)
 
     def test_violated_items_trigger_extra_defect_summary_call(self) -> None:
         config = get_config().model_copy(deep=True)
@@ -198,9 +232,8 @@ class ReportComparisonAgentTest(unittest.TestCase):
         client = StubReportComparisonClient(
             [
                 {
-                    "summary": "covered=0, partial=0, missing=0, violated=1, not_applicable=0",
-                    "coverage_score": 0.0,
-                    "items": [
+                    "summary": "matched covered=0, violated=1",
+                    "matched_items": [
                         {
                             "clause_id": "sl258:2017:main:6.2.1",
                             "status": "violated",
@@ -208,6 +241,7 @@ class ReportComparisonAgentTest(unittest.TestCase):
                             "reason": "与条款要求冲突。",
                         }
                     ],
+                    "explored_clause_ids": ["sl258:2017:main:6.2.1"],
                 },
                 {
                     "summary": "报告文本显示相关管理要求未落实，存在明显违规缺口和运行风险。",
@@ -242,9 +276,8 @@ class ReportComparisonAgentTest(unittest.TestCase):
         client = StubReportComparisonClient(
             [
                 {
-                    "summary": "covered=0, partial=0, missing=0, violated=1, not_applicable=0",
-                    "coverage_score": 0.0,
-                    "items": [
+                    "summary": "matched covered=0, violated=1",
+                    "matched_items": [
                         {
                             "clause_id": "sl258:2017:main:6.2.1",
                             "status": "violated",
@@ -252,6 +285,7 @@ class ReportComparisonAgentTest(unittest.TestCase):
                             "reason": "与条款要求冲突。",
                         }
                     ],
+                    "explored_clause_ids": ["sl258:2017:main:6.2.1"],
                 },
                 {
                     "not_summary": "bad-payload",
@@ -276,7 +310,7 @@ class ReportComparisonAgentTest(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(result["summary"], "covered=0, partial=0, missing=0, violated=1, not_applicable=0")
+        self.assertEqual(result["summary"], "matched covered=0, violated=1")
         self.assertEqual(client.calls, 2)
 
     def test_violated_summary_accepts_plain_text_fallback_when_structured_parse_fails(self) -> None:
@@ -304,7 +338,7 @@ class ReportComparisonAgentTest(unittest.TestCase):
         )
 
         self.assertEqual(result["summary"], "报告指出相关管理要求未落实，存在明显违规缺口和运行风险。")
-        self.assertEqual(client.structured_calls, 2)
+        self.assertEqual(client.structured_calls, 1)
         self.assertEqual(client.text_calls, 1)
 
     def test_violated_summary_uses_single_structured_attempt_then_retries_plain_text(self) -> None:
@@ -331,7 +365,7 @@ class ReportComparisonAgentTest(unittest.TestCase):
         )
 
         self.assertEqual(result["summary"], "报告指出存在明显违规缺口，相关要求未落实并带来运行风险。")
-        self.assertEqual(client.structured_calls, 2)
+        self.assertEqual(client.structured_calls, 1)
         self.assertEqual(client.text_calls, 2)
 
 

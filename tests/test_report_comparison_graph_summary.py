@@ -23,7 +23,7 @@ class ReportComparisonGraphSummaryTest(unittest.TestCase):
                 "textNormalized": "应急预案文本",
                 "sectionPath": ["5 运行管理评价", "5.2 调度运行", "5.2.2 应急预案"],
             },
-            report_summary="covered=1, partial=2, missing=5, violated=0, not_applicable=0",
+            report_summary="matched covered=1, violated=0",
             standard_id="sl258:2017",
             nodes=[],
             edges=[],
@@ -36,7 +36,7 @@ class ReportComparisonGraphSummaryTest(unittest.TestCase):
         self.assertEqual(report_node["nodeType"], "report_unit")
         self.assertEqual(
             report_node["properties"]["summary"],
-            "covered=1, partial=2, missing=5, violated=0, not_applicable=0",
+            "matched covered=1, violated=0",
         )
         self.assertEqual(report_node["properties"]["text_content"], "应急预案文本")
 

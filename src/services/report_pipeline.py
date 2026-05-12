@@ -268,32 +268,40 @@ class ReportPipelineService:
         plan_by_block_id: dict[str, dict[str, Any]] = {}
         warnings: list[str] = []
         metrics: dict[str, Any] = {
-            'title_plan_source': 'llm_only' if getattr(self.outline_planner, 'enabled', False) else 'none',
+            'title_plan_source': 'llm' if getattr(self.outline_planner, 'enabled', False) else 'heuristic',
             'title_planner_enabled': bool(getattr(self.outline_planner, 'enabled', False)),
             'title_plan_llm_item_count': 0,
+            'title_plan_heuristic_item_count': 0,
         }
+        llm_item_count = 0
 
         if getattr(self.outline_planner, 'enabled', False):
-            try:
-                planner_result = self.outline_planner.plan_titles(document_id=document_id, title_inventory=heuristic_plan)
-            except Exception as exc:  # pragma: no cover - defensive fallback
-                warnings.append(f'planner_error: {exc}')
-                planner_result = None
-            if planner_result is not None:
-                warnings.extend(planner_result.warnings)
-                metrics.update(planner_result.metrics)
-                llm_item_count = 0
-                for item in planner_result.items:
-                    title_id = item.get('title_id')
-                    if not title_id or title_id not in heuristic_by_block_id:
-                        continue
-                    base_item = heuristic_by_block_id[title_id]
-                    merged_item = {**base_item, **item}
-                    merged_item['planner_source'] = item.get('planner_source') or 'llm'
-                    plan_by_block_id[title_id] = merged_item
-                    llm_item_count += 1
-                metrics['title_plan_llm_item_count'] = llm_item_count
-                metrics['title_plan_source'] = 'llm' if llm_item_count else 'none'
+            planner_result = self.outline_planner.plan_titles(document_id=document_id, title_inventory=heuristic_plan)
+            warnings.extend(planner_result.warnings)
+            metrics.update(planner_result.metrics)
+            for item in planner_result.items:
+                title_id = item.get('title_id')
+                if not title_id or title_id not in heuristic_by_block_id:
+                    continue
+                base_item = heuristic_by_block_id[title_id]
+                merged_item = {**base_item, **item}
+                merged_item['planner_source'] = item.get('planner_source') or 'llm'
+                plan_by_block_id[title_id] = merged_item
+                llm_item_count += 1
+            metrics['title_plan_llm_item_count'] = llm_item_count
+
+        heuristic_item_count = 0
+        if not plan_by_block_id:
+            for item in heuristic_plan:
+                plan_by_block_id[item['title_id']] = item
+                heuristic_item_count += 1
+
+        metrics['title_plan_heuristic_item_count'] = heuristic_item_count
+        metrics['title_plan_missing_item_count'] = max(0, len(title_inventory) - len(plan_by_block_id))
+        if llm_item_count:
+            metrics['title_plan_source'] = 'llm'
+        else:
+            metrics['title_plan_source'] = 'heuristic'
 
         plan = [plan_by_block_id[item['title_id']] for item in title_inventory if item['title_id'] in plan_by_block_id]
         return plan, plan_by_block_id, warnings, metrics
@@ -310,7 +318,7 @@ class ReportPipelineService:
                 if normalized in {'目录', '目 录'}:
                     spec = {'section_kind': 'toc', 'hierarchy_level': 1, 'ref': None, 'is_structural': False}
                 else:
-                    spec = {'section_kind': 'ignore', 'hierarchy_level': 4, 'ref': None, 'is_structural': False}
+                    spec = {'section_kind': 'ignore', 'hierarchy_level': 0, 'ref': None, 'is_structural': False}
             else:
                 spec = self._classify_title(
                     title['text'],
@@ -330,7 +338,7 @@ class ReportPipelineService:
             plan_item = {
                 **title,
                 **spec,
-                'role': spec['section_kind'],
+                'role': spec.get('role') or spec['section_kind'],
                 'planner_source': 'heuristic',
                 'confidence': None,
                 'rationale': None,
@@ -381,6 +389,7 @@ class ReportPipelineService:
         section_map: dict[str, dict[str, Any]] = {}
         section_stack: list[dict[str, Any]] = []
         text_buffer: list[dict[str, Any]] = []
+        unit_heading_stack: list[dict[str, Any]] = []
         order_index = 0
 
         def next_order() -> int:
@@ -439,6 +448,7 @@ class ReportPipelineService:
                     section['content_preview'] = preview[:500]
 
         def flush_text_unit() -> None:
+            nonlocal unit_heading_stack
             if not text_buffer:
                 return
             parent = active_section()
@@ -450,7 +460,7 @@ class ReportPipelineService:
             unit_uid = f'report:{document_id}:unit:{len(report_units) + 1}'
             section_path = [section['title'] for section in section_stack]
             structural_path = [section['title'] for section in section_stack if section.get('is_structural')]
-            local_heading_path = [section['title'] for section in section_stack if section.get('hierarchy_level', 0) >= 4]
+            local_heading_path = [heading['title'] for heading in unit_heading_stack]
             page_values = [block['page_idx'] for block in text_buffer]
             first_block = text_buffer[0]
             single_block_type = first_block['source_type'] if len(text_buffer) == 1 else 'text'
@@ -460,7 +470,11 @@ class ReportPipelineService:
                 'document_id': document_id,
                 'parent_section_uid': parent['section_uid'],
                 'unit_type': unit_type,
-                'title': first_block.get('table_caption') or first_block.get('figure_caption'),
+                'title': (
+                    unit_heading_stack[-1]['title']
+                    if unit_heading_stack
+                    else first_block.get('table_caption') or first_block.get('figure_caption')
+                ),
                 'html': first_block.get('table_html') if unit_type == 'table' else None,
                 'section_path': section_path,
                 'structural_path': structural_path,
@@ -477,13 +491,30 @@ class ReportPipelineService:
             register_member(unit_uid, normalized_text, text_buffer[-1], page_span=unit['source_page_span'])
             text_buffer.clear()
 
+        def trim_unit_heading_stack(hierarchy_level: int) -> None:
+            while unit_heading_stack and unit_heading_stack[-1]['hierarchy_level'] >= hierarchy_level:
+                unit_heading_stack.pop()
+
         for block in normalized_blocks:
             source_type = block['source_type']
 
             if source_type == 'title':
                 spec = title_plan_by_block_id.get(block['block_id'])
                 if spec is None or spec['section_kind'] == 'ignore':
+                    text_buffer.append(block)
+                    continue
+
+                if spec['section_kind'] == 'unit':
                     flush_text_unit()
+                    trim_unit_heading_stack(int(spec.get('hierarchy_level') or 2))
+                    unit_heading_stack.append(
+                        {
+                            'title': block['text'],
+                            'hierarchy_level': int(spec.get('hierarchy_level') or 2),
+                            'ref': spec.get('ref'),
+                            'planner_source': spec.get('planner_source'),
+                        }
+                    )
                     text_buffer.append(block)
                     continue
 
@@ -499,6 +530,7 @@ class ReportPipelineService:
                     order_index=next_order(),
                     plan_entry=spec,
                 )
+                unit_heading_stack.clear()
                 continue
 
             if source_type in TEXTUAL_BLOCK_TYPES:
@@ -734,6 +766,7 @@ class ReportPipelineService:
                 for page_idx in sorted(blocks_by_page)
                 if any(self._looks_structural_title(block['text_normalized']) for block in blocks_by_page[page_idx] if block['source_type'] == 'title')
                 and page_idx != toc_start_page
+                and not self._looks_like_toc_page(blocks_by_page[page_idx])
             ),
             None,
         )
@@ -744,9 +777,13 @@ class ReportPipelineService:
             for page_idx in sorted(blocks_by_page):
                 if page_idx < toc_start_page:
                     continue
+                if self._looks_like_toc_page(blocks_by_page[page_idx]):
+                    toc_pages.add(page_idx)
+                    continue
                 if first_structural_page is not None and page_idx >= first_structural_page:
                     break
-                toc_pages.add(page_idx)
+                if page_idx - toc_start_page <= 3:
+                    toc_pages.add(page_idx)
 
         for page_idx in sorted(blocks_by_page):
             if page_idx in toc_pages:
@@ -756,6 +793,22 @@ class ReportPipelineService:
             else:
                 page_roles[page_idx] = 'body'
         return page_roles
+
+    def _looks_like_toc_page(self, page_blocks: list[dict[str, Any]]) -> bool:
+        texts = [self._normalize_text(block.get('text_normalized') or block.get('text')) for block in page_blocks]
+        texts = [text for text in texts if text]
+        if not texts:
+            return False
+        if any(text in {'目录', '目 录'} for text in texts):
+            return True
+        toc_like_count = 0
+        for text in texts:
+            if '……' in text or '.....' in text or re.search(r'\.{2,}\s*\d+\s*$', text):
+                toc_like_count += 1
+                continue
+            if re.match(r'^\d+(?:\.\d+)*\s+.+\s+\d+\s*$', text):
+                toc_like_count += 1
+        return toc_like_count >= max(2, len(texts) // 2)
 
     def _looks_structural_title(self, text: str) -> bool:
         normalized = self._normalize_text(text)
@@ -781,7 +834,7 @@ class ReportPipelineService:
         if normalized in {'目录', '目 录'}:
             return {'section_kind': 'toc', 'hierarchy_level': 1, 'ref': None, 'is_structural': False}
         if normalized in {'内容提要', '内容摘要', '摘要'}:
-            return {'section_kind': 'front_matter', 'hierarchy_level': 1, 'ref': None, 'is_structural': False}
+            return {'section_kind': 'ignore', 'hierarchy_level': 0, 'ref': None, 'is_structural': False}
 
         appendix_match = APPENDIX_TITLE_RE.match(normalized)
         if appendix_match:
@@ -791,16 +844,14 @@ class ReportPipelineService:
         dotted_match = DOTTED_TITLE_RE.match(normalized)
         if dotted_match:
             ref = dotted_match.group('ref')
-            segments = ref.split('.')
-            hierarchy_level = 3 if len(segments) >= 3 else 2
-            section_kind = 'subsection' if hierarchy_level == 3 else 'section'
-            return {'section_kind': section_kind, 'hierarchy_level': hierarchy_level, 'ref': ref, 'is_structural': True}
+            hierarchy_level = 1 + len(ref.split('.'))
+            return {'section_kind': 'unit', 'hierarchy_level': hierarchy_level, 'ref': ref, 'is_structural': False}
 
         enumerated_match = ENUMERATED_TITLE_RE.match(normalized)
         if enumerated_match:
             return {
                 'section_kind': 'ignore',
-                'hierarchy_level': 5,
+                'hierarchy_level': 0,
                 'ref': enumerated_match.group('marker'),
                 'is_structural': False,
             }
@@ -809,7 +860,7 @@ class ReportPipelineService:
         if chinese_enumerated_match:
             return {
                 'section_kind': 'ignore',
-                'hierarchy_level': 4,
+                'hierarchy_level': 0,
                 'ref': chinese_enumerated_match.group('marker'),
                 'is_structural': False,
             }
@@ -817,18 +868,21 @@ class ReportPipelineService:
         single_number_match = SINGLE_NUMBER_TITLE_RE.match(normalized)
         if single_number_match and not normalized.startswith('20'):
             num = int(single_number_match.group('num'))
+            title = (single_number_match.group('title') or '').strip()
+            if title.startswith(('附图', '附表', '附件', '附录')):
+                return {'section_kind': 'appendix', 'hierarchy_level': 1, 'ref': str(num), 'is_structural': True}
             next_major_supported = bool(next_title_text and next_title_text.startswith(f'{num}.'))
             topic_ref_num = int(current_topic_ref) if current_topic_ref and str(current_topic_ref).isdigit() else None
             if current_structural_depth > 1 and not next_major_supported:
                 if topic_ref_num is None or num <= topic_ref_num + 1:
-                    return {'section_kind': 'topic', 'hierarchy_level': 4, 'ref': str(num), 'is_structural': False}
+                    return {'section_kind': 'ignore', 'hierarchy_level': 0, 'ref': str(num), 'is_structural': False}
             if current_chapter_num is None or not first_structural_seen or num == current_chapter_num + 1 or next_major_supported:
                 return {'section_kind': 'chapter', 'hierarchy_level': 1, 'ref': str(num), 'is_structural': True}
-            return {'section_kind': 'topic', 'hierarchy_level': 4, 'ref': str(num), 'is_structural': False}
+            return {'section_kind': 'ignore', 'hierarchy_level': 0, 'ref': str(num), 'is_structural': False}
 
         if first_structural_seen:
-            return {'section_kind': 'topic', 'hierarchy_level': 4, 'ref': None, 'is_structural': False}
-        return {'section_kind': 'front_matter', 'hierarchy_level': 1, 'ref': None, 'is_structural': False}
+            return {'section_kind': 'ignore', 'hierarchy_level': 0, 'ref': None, 'is_structural': False}
+        return {'section_kind': 'ignore', 'hierarchy_level': 0, 'ref': None, 'is_structural': False}
 
     def _open_section(
         self,
@@ -1110,6 +1164,7 @@ class ReportPipelineService:
             '',
             f'- Planner enabled: {metrics.get("title_planner_enabled")}',
             f'- LLM planned titles: {metrics.get("title_plan_llm_item_count", 0)}',
+            f'- Heuristic planned titles: {metrics.get("title_plan_heuristic_item_count", 0)}',
             f'- Warning count: {metrics.get("title_plan_warning_count", 0)}',
             '',
             '## Section Kinds',

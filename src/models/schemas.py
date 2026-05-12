@@ -138,9 +138,29 @@ class ReportComparisonItem(BaseModel):
     sectionId: str | None = None
     chapterId: str | None = None
     label: str
-    status: Literal["covered", "partial", "missing", "violated", "not_applicable"]
+    status: Literal["covered", "violated"]
     reason: str
     reportEvidence: str | None = None
+
+
+class ReportClauseEvidenceUnit(BaseModel):
+    reportUnitId: str
+    status: Literal["covered", "violated"]
+    reason: str
+    reportEvidence: str | None = None
+
+
+class ReportClauseSummary(BaseModel):
+    clauseId: str
+    clauseRef: str | None = None
+    sectionId: str | None = None
+    chapterId: str | None = None
+    label: str
+    finalStatus: Literal["covered", "violated", "missing"]
+    coveredCount: int = 0
+    violatedCount: int = 0
+    hitCount: int = 0
+    evidenceUnits: list[ReportClauseEvidenceUnit] = Field(default_factory=list)
 
 
 class ReportUnitComparisonResult(BaseModel):
@@ -156,6 +176,8 @@ class ReportUnitComparisonResult(BaseModel):
     matchedChapterIds: list[str] = Field(default_factory=list)
     matchedSectionIds: list[str] = Field(default_factory=list)
     items: list[ReportComparisonItem] = Field(default_factory=list)
+    matchedClauses: list[ReportComparisonItem] = Field(default_factory=list)
+    exploredClauseIds: list[str] = Field(default_factory=list)
     graph: GraphWorkbenchResponse
 
 
@@ -179,6 +201,7 @@ class ReportComparisonDetail(BaseModel):
     matchedChapterIds: list[str] = Field(default_factory=list)
     matchedSectionIds: list[str] = Field(default_factory=list)
     items: list[ReportComparisonItem] = Field(default_factory=list)
+    clauseSummaries: list[ReportClauseSummary] = Field(default_factory=list)
     unitResults: list[ReportUnitComparisonResult] = Field(default_factory=list)
     error: str | None = None
 
