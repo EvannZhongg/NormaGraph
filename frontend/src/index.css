@@ -568,6 +568,41 @@
   }
 }
 
+.math-text mjx-container {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.math-text mjx-container[display='true'] {
+  margin: 0.55rem 0;
+}
+
+.report-unit-table table {
+  width: 100%;
+  min-width: max-content;
+  border-collapse: collapse;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.report-unit-table th,
+.report-unit-table td {
+  border: 1px solid color-mix(in srgb, var(--line) 88%, white 12%);
+  padding: 8px 10px;
+  vertical-align: top;
+  text-align: left;
+}
+
+.report-unit-table th {
+  background: color-mix(in srgb, var(--brand-soft) 84%, white 16%);
+  font-weight: 600;
+}
+
+.report-unit-table tr:nth-child(even) td {
+  background: rgba(248, 250, 252, 0.72);
+}
+
 @media (max-width: 768px) {
   .header-nav {
     @apply order-3 w-full justify-center overflow-auto;

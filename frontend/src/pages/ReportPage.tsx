@@ -1,19 +1,25 @@
 import EdgeCurveProgram from '@sigma/edge-curve'
-import { FileUp, LoaderCircle } from 'lucide-react'
+import { ChevronDown, ChevronUp, FileText, FileUp, LoaderCircle, Network } from 'lucide-react'
 import Sigma from 'sigma'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 
+import { HtmlContent } from '../components/HtmlContent'
+import { MathText } from '../components/MathText'
 import { StatusBadge } from '../components/StatusBadge'
 import {
   getReportComparison,
   getReportSpace,
+  loadKgSubgraph,
   listDocumentJobs,
   listDocuments,
   listKgSpaces,
   startReportComparison,
   uploadDocument,
   type DocumentSummary,
+  type GraphEdgeData,
+  type GraphNodeData,
+  type GraphWorkbenchData,
   type IngestionJob,
   type KgSpaceSummary,
   type ReportComparisonDetail,
@@ -23,6 +29,27 @@ import {
   type ReportUnitSummary,
 } from '../lib/api'
 import { createRuntimeGraph, layoutGraph, type RuntimeGraph } from '../lib/graph-workbench'
+
+type ReportContentView = 'blocks' | 'comparison-graph'
+type ComparisonStatus = ReportComparisonItem['status']
+type ComparisonGraphStatusView = 'dominant' | Exclude<ComparisonStatus, 'not_applicable'>
+type ComparisonGraphFrequencyRangeId = 'all' | 'hit' | '1' | '2-5' | '6-20' | '21-50' | '51+'
+
+interface FullKgGraphPayload {
+  standardId: string
+  nodes: GraphNodeData[]
+  edges: GraphEdgeData[]
+}
+
+interface ReportUnitMention {
+  unitUid: string
+  label: string
+  pageSpan: number[]
+  status: ComparisonStatus
+  reason: string
+  evidence?: string | null
+  summary?: string | null
+}
 
 export function ReportPage() {
   const [file, setFile] = useState<File | null>(null)
@@ -36,13 +63,20 @@ export function ReportPage() {
   const [reportDetail, setReportDetail] = useState<ReportSpaceDetail | null>(null)
   const [selectedUnitId, setSelectedUnitId] = useState<string | null>(null)
   const [loadingComparison, setLoadingComparison] = useState(false)
+  const [loadingFullKgGraph, setLoadingFullKgGraph] = useState(false)
   const [startingComparison, setStartingComparison] = useState(false)
   const [comparisonDetail, setComparisonDetail] = useState<ReportComparisonDetail | null>(null)
   const [selectedGraphNodeId, setSelectedGraphNodeId] = useState<string | null>(null)
+  const [contentView, setContentView] = useState<ReportContentView>('blocks')
+  const [fullKgGraph, setFullKgGraph] = useState<FullKgGraphPayload | null>(null)
+  const [comparisonGraphStatusView, setComparisonGraphStatusView] = useState<ComparisonGraphStatusView>('dominant')
+  const [comparisonGraphFrequencyRange, setComparisonGraphFrequencyRange] = useState<ComparisonGraphFrequencyRangeId>('all')
 
   const graphContainerRef = useRef<HTMLDivElement | null>(null)
+  const sigmaContainerRef = useRef<HTMLDivElement | null>(null)
   const sigmaRef = useRef<Sigma | null>(null)
   const runtimeGraphRef = useRef<RuntimeGraph | null>(null)
+  const unitButtonRefs = useRef(new Map<string, HTMLButtonElement>())
 
   const selectedReport = useMemo(
     () => reports.find((item) => item.documentId === selectedReportId) ?? null,
@@ -60,7 +94,6 @@ export function ReportPage() {
 
   const orderedUnits = useMemo(
     () => [...(reportDetail?.reportUnits ?? [])]
-      .filter((item) => item.unitType === 'text')
       .sort((left, right) => left.orderIndex - right.orderIndex),
     [reportDetail],
   )
@@ -82,12 +115,72 @@ export function ReportPage() {
     () => comparisonDetail?.unitResults.find((item) => item.reportUnitId === selectedUnitId) ?? null,
     [comparisonDetail, selectedUnitId],
   )
+  const selectedReportUnit = useMemo(
+    () => orderedUnits.find((item) => item.unitUid === selectedUnitId) ?? null,
+    [orderedUnits, selectedUnitId],
+  )
   const comparisonSummary = useMemo(() => summarizeComparison(comparisonDetail?.items ?? []), [comparisonDetail?.items])
+  const violatedUnitIds = useMemo(() => {
+    if (!comparisonDetail) {
+      return []
+    }
+    const violatedUnitIdSet = new Set(
+      comparisonDetail.unitResults
+        .filter((item) => item.items.some((comparisonItem) => comparisonItem.status === 'violated'))
+        .map((item) => item.reportUnitId),
+    )
+    return orderedUnits.filter((item) => violatedUnitIdSet.has(item.unitUid)).map((item) => item.unitUid)
+  }, [comparisonDetail, orderedUnits])
   const evaluationInProgress = comparisonDetail?.status === 'queued' || comparisonDetail?.status === 'running'
+  const evaluationStageLabel = useMemo(() => {
+    if (!comparisonDetail) {
+      return '-'
+    }
+    const stage = comparisonDetail.processingStage
+    if (stage === 'routing') {
+      return 'Routing'
+    }
+    if (stage === 'assessment') {
+      return 'Assessing'
+    }
+    if (stage === 'finalizing') {
+      return 'Finalizing'
+    }
+    if (stage === 'completed') {
+      return 'Completed'
+    }
+    if (stage === 'failed') {
+      return 'Failed'
+    }
+    if (stage === 'queued') {
+      return 'Queued'
+    }
+    return evaluationInProgress ? 'Processing' : '-'
+  }, [comparisonDetail, evaluationInProgress])
+  const comparisonGraphKey = useMemo(() => buildComparisonGraphKey(comparisonDetail), [comparisonDetail?.unitResults])
+  const comparisonGraphData = useMemo(() => {
+    if (!selectedKgSpaceId || fullKgGraph?.standardId !== selectedKgSpaceId) {
+      return null
+    }
+    return buildFullReportComparisonGraph(selectedKgSpaceId, fullKgGraph.nodes, fullKgGraph.edges, comparisonDetail, orderedUnits)
+  }, [comparisonGraphKey, fullKgGraph, orderedUnits, selectedKgSpaceId])
+  const comparisonGraphRangeCounts = useMemo(
+    () => summarizeComparisonGraphFrequencyRanges(comparisonGraphData, comparisonGraphStatusView),
+    [comparisonGraphData, comparisonGraphStatusView],
+  )
+  const filteredComparisonGraphData = useMemo(
+    () => filterComparisonGraph(comparisonGraphData, comparisonGraphFrequencyRange, comparisonGraphStatusView),
+    [comparisonGraphData, comparisonGraphFrequencyRange, comparisonGraphStatusView],
+  )
+  const comparisonGraphMeta = useMemo(() => summarizeComparisonGraph(filteredComparisonGraphData), [filteredComparisonGraphData])
+  const activeGraphData = useMemo(
+    () => (contentView === 'comparison-graph' ? filteredComparisonGraphData : selectedUnitComparison?.graph ?? null),
+    [contentView, filteredComparisonGraphData, selectedUnitComparison?.graph],
+  )
   const selectedGraphNode = useMemo(() => {
-    const nodes = selectedUnitComparison?.graph.nodes ?? []
+    const nodes = activeGraphData?.nodes ?? []
     return nodes.find((item) => item.id === selectedGraphNodeId) ?? null
-  }, [selectedGraphNodeId, selectedUnitComparison?.graph.nodes])
+  }, [activeGraphData?.nodes, selectedGraphNodeId])
 
   useEffect(() => {
     void initializePage()
@@ -118,6 +211,7 @@ export function ReportPage() {
 
   useEffect(() => {
     setComparisonDetail(null)
+    setFullKgGraph(null)
     setSelectedGraphNodeId(null)
   }, [selectedKgSpaceId])
 
@@ -140,16 +234,63 @@ export function ReportPage() {
   }, [evaluationInProgress, selectedKgSpaceId, selectedReportId])
 
   useEffect(() => {
-    const graphData = selectedUnitComparison?.graph ?? null
+    if (contentView !== 'comparison-graph' || !selectedKgSpaceId) {
+      return
+    }
+    if (fullKgGraph?.standardId === selectedKgSpaceId) {
+      return
+    }
+
+    let cancelled = false
+    setLoadingFullKgGraph(true)
+    loadKgSubgraph(selectedKgSpaceId)
+      .then((payload) => {
+        if (!cancelled) {
+          setFullKgGraph({ standardId: selectedKgSpaceId, nodes: payload.nodes, edges: payload.edges })
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          toast.error(extractErrorMessage(error, '全量 KG 图谱加载失败'))
+          setFullKgGraph(null)
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoadingFullKgGraph(false)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [contentView, fullKgGraph?.standardId, selectedKgSpaceId])
+
+  useEffect(() => {
+    setSelectedGraphNodeId(null)
+  }, [contentView])
+
+  useEffect(() => {
+    const graphData = activeGraphData
     const container = graphContainerRef.current
     if (!container) {
       return
     }
 
+    if (sigmaRef.current && sigmaContainerRef.current !== container) {
+      sigmaRef.current.kill()
+      sigmaRef.current = null
+      runtimeGraphRef.current = null
+      sigmaContainerRef.current = null
+      container.innerHTML = ''
+    }
+    sigmaContainerRef.current = container
+
     if (!graphData || graphData.nodes.length === 0) {
       sigmaRef.current?.kill()
       sigmaRef.current = null
       runtimeGraphRef.current = null
+      sigmaContainerRef.current = null
       container.innerHTML = ''
       return
     }
@@ -159,27 +300,38 @@ export function ReportPage() {
     Object.entries(targetPositions).forEach(([nodeId, position]) => {
       runtime.mergeNodeAttributes(nodeId, position)
     })
+    applyReportGraphStyling(runtime, graphData, contentView === 'comparison-graph' ? comparisonGraphStatusView : 'dominant')
     runtimeGraphRef.current = runtime
 
     if (!sigmaRef.current) {
       sigmaRef.current = new Sigma(runtime, container, createReportSigmaSettings())
       sigmaRef.current.on('clickNode', ({ node }) => setSelectedGraphNodeId(node))
+      sigmaRef.current.on('clickStage', () => setSelectedGraphNodeId(null))
     } else {
       sigmaRef.current.setGraph(runtime)
       sigmaRef.current.setSettings(createReportSigmaSettings())
       sigmaRef.current.refresh()
     }
 
-    setSelectedGraphNodeId(graphData.rootNodeId ?? graphData.nodes[0]?.id ?? null)
+    const defaultNodeId =
+      contentView === 'comparison-graph'
+        ? null
+        : graphData.nodes.find((item) => Number(item.properties?.comparison_frequency ?? 0) > 0)?.id
+          ?? graphData.nodes.find((item) => item.id !== graphData.rootNodeId)?.id
+          ?? graphData.rootNodeId
+          ?? graphData.nodes[0]?.id
+          ?? null
+    setSelectedGraphNodeId(defaultNodeId)
     return () => {
       sigmaRef.current?.refresh()
     }
-  }, [selectedUnitComparison?.graph])
+  }, [activeGraphData, comparisonGraphStatusView, contentView])
 
   useEffect(() => {
     return () => {
       sigmaRef.current?.kill()
       sigmaRef.current = null
+      sigmaContainerRef.current = null
     }
   }, [])
 
@@ -226,7 +378,7 @@ export function ReportPage() {
       try {
         const detail = await getReportSpace(documentId)
         setReportDetail(detail)
-        setSelectedUnitId((current) => current ?? detail.reportUnits.find((item) => item.unitType === 'text')?.unitUid ?? detail.reportUnits[0]?.unitUid ?? null)
+        setSelectedUnitId((current) => current ?? detail.reportUnits[0]?.unitUid ?? null)
       } catch (error) {
         if (isNotFoundError(error)) {
           setReportDetail(null)
@@ -321,15 +473,42 @@ export function ReportPage() {
     const result = comparisonDetail.unitResults.find((item) => item.reportUnitId === unit.unitUid)
     if (!result) {
       if (evaluationInProgress) {
-        toast.error('该段落评估尚未完成')
+        toast.error('该单元评估尚未完成')
       } else {
-        toast.error('该段落暂无评估结果')
+        toast.error('该单元暂无评估结果')
       }
     }
   }
 
+  function scrollToReportUnit(unitId: string) {
+    setSelectedUnitId(unitId)
+    window.requestAnimationFrame(() => {
+      unitButtonRefs.current.get(unitId)?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+      })
+    })
+  }
+
+  function handleJumpToViolated(direction: 'previous' | 'next') {
+    if (!violatedUnitIds.length) {
+      toast.error('当前没有 violated 单元')
+      return
+    }
+    const currentIndex = selectedUnitId ? violatedUnitIds.indexOf(selectedUnitId) : -1
+    const targetIndex =
+      direction === 'next'
+        ? currentIndex === -1
+          ? 0
+          : (currentIndex + 1) % violatedUnitIds.length
+        : currentIndex === -1
+          ? violatedUnitIds.length - 1
+          : (currentIndex - 1 + violatedUnitIds.length) % violatedUnitIds.length
+    scrollToReportUnit(violatedUnitIds[targetIndex])
+  }
+
   return (
-    <div className="grid h-[calc(100vh-110px)] gap-5 xl:grid-cols-[320px_minmax(0,1fr)_420px]">
+    <div className={`grid h-[calc(100vh-110px)] gap-5 ${contentView === 'comparison-graph' ? 'xl:grid-cols-[320px_minmax(0,1fr)]' : 'xl:grid-cols-[320px_minmax(0,1fr)_420px]'}`}>
       <aside className="grid min-h-0 gap-5 xl:grid-rows-[auto,1fr]">
         <section className="panel-surface p-5">
           <div className="grid gap-4">
@@ -402,7 +581,7 @@ export function ReportPage() {
                 {startingComparison ? 'Starting...' : 'Run Evaluation'}
               </button>
               <div className="flex items-center justify-between text-xs">
-                <span className="text-[var(--text-secondary)]">Evaluation</span>
+                <span className="text-[var(--text-secondary)]">{evaluationStageLabel}</span>
                 <StatusBadge status={comparisonDetail?.status ?? 'idle'} />
               </div>
               <div className="h-2 overflow-hidden rounded-full bg-white/70">
@@ -415,7 +594,7 @@ export function ReportPage() {
                 <span>
                   {comparisonDetail ? `${comparisonDetail.completedUnits} / ${comparisonDetail.totalUnits}` : '0 / 0'}
                 </span>
-                <span>{comparisonDetail ? `${Math.round(comparisonDetail.progress * 100)}%` : '-'}</span>
+                <span>{comparisonDetail ? `${Math.max(1, Math.round(comparisonDetail.progress * 100))}%` : '-'}</span>
               </div>
               {comparisonDetail?.error ? (
                 <div className="text-xs leading-5 text-[var(--danger, #b42318)]">
@@ -456,9 +635,32 @@ export function ReportPage() {
                 <span>Covered {comparisonSummary.covered}</span>
                 <span>Partial {comparisonSummary.partial}</span>
                 <span>Missing {comparisonSummary.missing}</span>
-                <span>Violated {comparisonSummary.violated}</span>
+                <div className="flex items-center justify-between gap-2">
+                  <span>Violated {comparisonSummary.violated}</span>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => handleJumpToViolated('previous')}
+                      disabled={!violatedUnitIds.length}
+                      className="rounded border border-[var(--line)] p-1 text-[var(--text-primary)] transition hover:bg-[var(--brand-soft)] disabled:cursor-not-allowed disabled:opacity-40"
+                      aria-label="Jump to previous violated unit"
+                      title="Jump to previous violated unit"
+                    >
+                      <ChevronUp className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleJumpToViolated('next')}
+                      disabled={!violatedUnitIds.length}
+                      className="rounded border border-[var(--line)] p-1 text-[var(--text-primary)] transition hover:bg-[var(--brand-soft)] disabled:cursor-not-allowed disabled:opacity-40"
+                      aria-label="Jump to next violated unit"
+                      title="Jump to next violated unit"
+                    >
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </div>
               </div>
-              {comparisonDetail?.summary ? <div className="text-xs leading-5 text-[var(--text-primary)]">{comparisonDetail.summary}</div> : null}
             </div>
           </div>
         </section>
@@ -470,13 +672,159 @@ export function ReportPage() {
             <div className="text-sm text-[var(--text-secondary)]">
               {selectedReportId ?? 'No report selected'}
             </div>
-            {loadingReports || loadingComparison || evaluationInProgress ? (
+            <div className="flex items-center gap-3">
+              <div className="flex rounded border border-[var(--line)] bg-white/60 p-0.5">
+                <button
+                  type="button"
+                  onClick={() => setContentView('blocks')}
+                  className={`surface-button compact-button border-0 px-3 py-1.5 ${contentView === 'blocks' ? 'primary-button' : ''}`}
+                  aria-pressed={contentView === 'blocks'}
+                >
+                  <FileText className="h-4 w-4" />
+                  文本分块
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setContentView('comparison-graph')}
+                  className={`surface-button compact-button border-0 px-3 py-1.5 ${contentView === 'comparison-graph' ? 'primary-button' : ''}`}
+                  aria-pressed={contentView === 'comparison-graph'}
+                >
+                  <Network className="h-4 w-4" />
+                  对比图谱
+                </button>
+              </div>
+            {loadingReports || loadingComparison || evaluationInProgress || loadingFullKgGraph ? (
               <div className="flex items-center gap-2 text-sm text-[var(--text-secondary)]">
                 <LoaderCircle className="h-4 w-4 animate-spin" />
-                {loadingReports ? 'Loading...' : loadingComparison ? 'Loading comparison...' : 'Evaluating...'}
+                  {loadingReports ? 'Loading...' : loadingComparison ? 'Loading comparison...' : loadingFullKgGraph ? 'Loading full KG...' : 'Evaluating...'}
               </div>
             ) : null}
+            </div>
           </div>
+          {contentView === 'comparison-graph' ? (
+            <div className="relative min-h-0 overflow-hidden">
+              <div ref={graphContainerRef} className="h-full w-full" />
+              <div className="absolute left-4 top-4 z-10 grid max-w-[360px] gap-3">
+                <div className="subtle-surface grid gap-2 px-4 py-3 text-xs shadow-sm">
+                  <div className="flex items-center justify-between gap-4">
+                    <span className="font-semibold text-[var(--text-primary)]">全量 KG 对比图谱</span>
+                    <span className="text-[var(--text-secondary)]">{comparisonGraphMeta.kgNodes} / {comparisonGraphMeta.kgEdges}</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[var(--text-secondary)]">
+                    <span>实体命中 {comparisonGraphMeta.entityHits}</span>
+                    <span>关系命中 {comparisonGraphMeta.relationHits}</span>
+                    <span>涉及文本块 {comparisonGraphMeta.reportUnits}</span>
+                    <span>最高频次 {comparisonGraphMeta.maxFrequency}</span>
+                  </div>
+                </div>
+                <div className="subtle-surface grid gap-2 px-4 py-3 text-xs shadow-sm">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="font-semibold text-[var(--text-primary)]">渲染视角</span>
+                    <span className="text-[var(--text-secondary)]">{comparisonStatusViewLabel(comparisonGraphStatusView)}</span>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {COMPARISON_GRAPH_STATUS_VIEWS.map((view) => (
+                      <button
+                        key={view}
+                        type="button"
+                        onClick={() => {
+                          setComparisonGraphStatusView(view)
+                          setSelectedGraphNodeId(null)
+                        }}
+                        className={`surface-button compact-button border-0 px-2.5 py-1 ${comparisonGraphStatusView === view ? 'primary-button' : ''}`}
+                        aria-pressed={comparisonGraphStatusView === view}
+                      >
+                        {comparisonStatusViewLabel(view)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="subtle-surface grid gap-2 px-4 py-3 text-xs shadow-sm">
+                  <div className="font-semibold text-[var(--text-primary)]">频次区间</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {COMPARISON_GRAPH_FREQUENCY_RANGES.map((range) => (
+                      <button
+                        key={range.id}
+                        type="button"
+                        onClick={() => {
+                          setComparisonGraphFrequencyRange(range.id)
+                          setSelectedGraphNodeId(null)
+                        }}
+                        className={`surface-button compact-button min-w-[74px] justify-between gap-2 border-0 px-2.5 py-1 ${comparisonGraphFrequencyRange === range.id ? 'primary-button' : ''}`}
+                        aria-pressed={comparisonGraphFrequencyRange === range.id}
+                      >
+                        <span>{range.label}</span>
+                        <span className={`rounded-full px-1.5 py-0.5 text-[10px] leading-none ${comparisonGraphFrequencyRange === range.id ? 'bg-white/25 text-white' : 'bg-[var(--surface-muted)] text-[var(--text-secondary)]'}`}>
+                          {comparisonGraphRangeCounts[range.id] ?? 0}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="subtle-surface grid gap-2 px-4 py-3 text-xs text-[var(--text-secondary)] shadow-sm">
+                  {(['covered', 'partial', 'missing', 'violated'] as ComparisonStatus[]).map((status) => (
+                    <div key={status} className="flex items-center justify-between gap-3">
+                      <span className="flex items-center gap-2">
+                        <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: comparisonStatusColor(status, 1) }} />
+                        {status}
+                      </span>
+                      <span>{comparisonGraphMeta.statusCounts[status] ?? 0}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              {selectedGraphNode ? (
+                <div className="absolute bottom-4 right-4 z-10 max-h-[54%] w-[min(520px,calc(100%-2rem))] overflow-auto rounded-lg border border-[var(--line)] bg-white/92 px-4 py-4 text-sm shadow-sm backdrop-blur">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="font-semibold text-[var(--text-primary)]">{selectedGraphNode.label}</div>
+                      <div className="mt-1 text-xs text-[var(--text-secondary)]">{selectedGraphNode.nodeType}</div>
+                    </div>
+                    {Number(selectedGraphNode.properties?.comparison_frequency ?? 0) > 0 ? (
+                      <span className="rounded border border-[var(--line)] px-2 py-1 text-xs text-[var(--text-secondary)]">
+                        freq {String(selectedGraphNode.properties.comparison_frequency)}
+                      </span>
+                    ) : null}
+                  </div>
+                  <MathText
+                    text={resolveNodeText(selectedGraphNode.properties)}
+                    className="mt-3 whitespace-pre-wrap text-xs leading-5 text-[var(--text-secondary)]"
+                  />
+                  {readReportUnitMentions(selectedGraphNode.properties).length ? (
+                    <div className="mt-4 grid gap-2 border-t pt-3" style={{ borderColor: 'var(--line)' }}>
+                      <div className="text-xs font-semibold uppercase tracking-[0.14em] text-[var(--text-dim)]">
+                        涉及文本块
+                      </div>
+                      {readReportUnitMentions(selectedGraphNode.properties).map((unit) => (
+                        <button
+                          key={`${selectedGraphNode.id}:${unit.unitUid}:${unit.status}`}
+                          type="button"
+                          onClick={() => {
+                            setContentView('blocks')
+                            window.setTimeout(() => scrollToReportUnit(unit.unitUid), 0)
+                          }}
+                          className="subtle-surface grid gap-1 px-3 py-3 text-left text-xs transition hover:border-[var(--brand)]"
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="font-medium text-[var(--text-primary)]">{unit.label}</span>
+                            <span className="text-[var(--text-secondary)]">{unit.status}</span>
+                          </div>
+                          <div className="text-[var(--text-secondary)]">Pages {unit.pageSpan.join('-') || '-'}</div>
+                          {unit.reason ? <div className="leading-5 text-[var(--text-secondary)]">{unit.reason}</div> : null}
+                          {unit.evidence ? <div className="leading-5 text-[var(--text-dim)]">{unit.evidence}</div> : null}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+              {!activeGraphData?.nodes.length && !loadingFullKgGraph ? (
+                <div className="absolute inset-0 grid place-items-center text-sm text-[var(--text-secondary)]">
+                  请选择 KG space，并在需要时先运行整份报告评估。
+                </div>
+              ) : null}
+            </div>
+          ) : (
           <div className="min-h-0 overflow-auto px-5 py-5">
             <div className="grid gap-4">
               {orderedUnits.map((unit, index) => {
@@ -491,6 +839,13 @@ export function ReportPage() {
                       </div>
                     ) : null}
                     <button
+                      ref={(element) => {
+                        if (element) {
+                          unitButtonRefs.current.set(unit.unitUid, element)
+                          return
+                        }
+                        unitButtonRefs.current.delete(unit.unitUid)
+                      }}
                       type="button"
                       onClick={() => void handleSelectUnit(unit)}
                       className={`subtle-surface w-full px-4 py-4 text-left transition ${unit.unitUid === selectedUnitId ? 'border-[var(--brand)] bg-[var(--brand-soft)]' : ''}`}
@@ -499,54 +854,611 @@ export function ReportPage() {
                         <span className="text-xs text-[var(--text-secondary)]">{unit.pageSpan.join('-') || '-'}</span>
                         <span className="text-xs text-[var(--text-secondary)]">{unit.unitType}</span>
                       </div>
-                      <div className="mt-3 whitespace-pre-wrap text-sm leading-7 text-[var(--text-primary)]">{unit.textNormalized}</div>
+                      {unit.unitType === 'table' && unit.html ? (
+                        <div className="mt-3 grid gap-3">
+                          {unit.title ? (
+                            <div className="text-sm font-medium leading-6 text-[var(--text-primary)]">{unit.title}</div>
+                          ) : null}
+                          <HtmlContent
+                            html={unit.html}
+                            className="report-unit-table overflow-x-auto rounded-xl border border-[var(--line)] bg-white/90 p-3 text-sm text-[var(--text-primary)]"
+                          />
+                        </div>
+                      ) : (
+                        <MathText
+                          text={unit.textNormalized}
+                          className="mt-3 whitespace-pre-wrap text-sm leading-7 text-[var(--text-primary)]"
+                        />
+                      )}
                     </button>
                   </div>
                 )
               })}
-              {!orderedUnits.length && !loadingReports ? <div className="text-sm text-[var(--text-secondary)]">No parsed text</div> : null}
+              {!orderedUnits.length && !loadingReports ? <div className="text-sm text-[var(--text-secondary)]">No parsed unit</div> : null}
             </div>
           </div>
+          )}
         </div>
       </section>
 
+      {contentView === 'blocks' ? (
       <section className="panel-surface min-h-0 overflow-hidden">
         <div className="grid h-full min-h-0 grid-rows-[1fr,auto]">
             <div className="relative min-h-[320px]">
               <div ref={graphContainerRef} className="h-full w-full" />
             {!selectedUnitComparison?.graph.nodes.length ? (
               <div className="absolute inset-0 grid place-items-center text-sm text-[var(--text-secondary)]">
-                Select a report paragraph to view saved result.
+                Select a report unit to view saved result.
               </div>
             ) : null}
           </div>
           <div className="border-t px-5 py-4" style={{ borderColor: 'var(--line)' }}>
-            {selectedGraphNode ? (
-              <div className="grid gap-2">
-                <div className="text-sm font-semibold text-[var(--text-primary)]">{selectedGraphNode.label}</div>
-                <div className="text-xs text-[var(--text-secondary)]">{selectedGraphNode.nodeType}</div>
-                <div className="max-h-40 overflow-auto whitespace-pre-wrap text-xs leading-5 text-[var(--text-secondary)]">
-                  {resolveNodeText(selectedGraphNode.properties)}
-                </div>
-              </div>
-            ) : selectedUnitComparison ? (
-              <div className="grid gap-3">
-                {selectedUnitComparison.items.slice(0, 8).map((item) => (
-                  <div key={item.clauseId} className="subtle-surface px-3 py-3 text-xs">
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="font-medium text-[var(--text-primary)]">{item.clauseRef ?? item.label}</span>
-                      <span className="text-[var(--text-secondary)]">{item.status}</span>
-                    </div>
-                    <div className="mt-2 leading-5 text-[var(--text-secondary)]">{item.reason}</div>
+            {selectedUnitComparison ? (
+              <div className="grid gap-4">
+                <div className="subtle-surface grid gap-2 px-4 py-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-xs font-semibold uppercase tracking-[0.14em] text-[var(--text-dim)]">Report Unit</span>
+                    <span className="text-xs text-[var(--text-secondary)]">
+                      {selectedReportUnit?.pageSpan.join('-') || '-'}
+                    </span>
                   </div>
-                ))}
+                  <div className="text-sm leading-6 text-[var(--text-primary)]">
+                    {selectedUnitComparison.summary}
+                  </div>
+                </div>
+
+                {selectedGraphNode && selectedGraphNode.nodeType !== 'report_unit' ? (
+                  <div className="grid gap-2">
+                    <div className="text-sm font-semibold text-[var(--text-primary)]">{selectedGraphNode.label}</div>
+                    <div className="text-xs text-[var(--text-secondary)]">{selectedGraphNode.nodeType}</div>
+                    <MathText
+                      text={resolveNodeText(selectedGraphNode.properties)}
+                      className="max-h-40 overflow-auto whitespace-pre-wrap text-xs leading-5 text-[var(--text-secondary)]"
+                    />
+                  </div>
+                ) : (
+                  <div className="grid gap-3">
+                    {selectedUnitComparison.items.slice(0, 8).map((item) => (
+                      <div key={item.clauseId} className="subtle-surface px-3 py-3 text-xs">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="font-medium text-[var(--text-primary)]">{item.clauseRef ?? item.label}</span>
+                          <span className="text-[var(--text-secondary)]">{item.status}</span>
+                        </div>
+                        <div className="mt-2 leading-5 text-[var(--text-secondary)]">{item.reason}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             ) : null}
           </div>
         </div>
       </section>
+      ) : null}
     </div>
   )
+}
+
+const COMPARISON_STATUSES: ComparisonStatus[] = ['covered', 'partial', 'missing', 'violated', 'not_applicable']
+const REPORT_COMPARISON_DISPLAY_NODE_TYPES = new Set(['standard', 'appendix', 'chapter', 'section', 'clause'])
+const COMPARISON_GRAPH_STATUS_VIEWS: ComparisonGraphStatusView[] = ['dominant', 'covered', 'partial', 'missing', 'violated']
+const COMPARISON_GRAPH_FREQUENCY_RANGES: { id: ComparisonGraphFrequencyRangeId; label: string; min: number; max: number | null }[] = [
+  { id: 'all', label: '全部', min: 0, max: null },
+  { id: 'hit', label: '命中', min: 1, max: null },
+  { id: '1', label: '1次', min: 1, max: 1 },
+  { id: '2-5', label: '2-5次', min: 2, max: 5 },
+  { id: '6-20', label: '6-20次', min: 6, max: 20 },
+  { id: '21-50', label: '21-50次', min: 21, max: 50 },
+  { id: '51+', label: '51+次', min: 51, max: null },
+]
+
+function buildComparisonGraphKey(comparisonDetail: ReportComparisonDetail | null) {
+  if (!comparisonDetail?.unitResults.length) {
+    return 'empty'
+  }
+  return comparisonDetail.unitResults
+    .map((unit) => {
+      const itemKey = unit.items
+        .map((item) => `${item.clauseId}:${item.status}`)
+        .sort()
+        .join(',')
+      const nodeKey = unit.graph.nodes
+        .map((node) => node.id)
+        .sort()
+        .join(',')
+      const edgeKey = unit.graph.edges
+        .map((edge) => edge.id)
+        .sort()
+        .join(',')
+      return `${unit.reportUnitId}:${unit.coverageScore}:${itemKey}:${nodeKey}:${edgeKey}`
+    })
+    .join('|')
+}
+
+function buildFullReportComparisonGraph(
+  standardId: string,
+  kgNodes: GraphNodeData[],
+  kgEdges: GraphEdgeData[],
+  comparisonDetail: ReportComparisonDetail | null,
+  reportUnits: ReportUnitSummary[],
+): GraphWorkbenchData {
+  const displayKgNodes = kgNodes.filter((node) => isReportComparisonDisplayNode(node))
+  const kgNodeIds = new Set(displayKgNodes.map((node) => String(node.node_uid || '')).filter(Boolean))
+  const kgEdgeIds = new Set(kgEdges.map((edge) => String(edge.edge_uid || '')).filter(Boolean))
+  const edgeIdBySignature = new Map<string, string>()
+  kgEdges.forEach((edge) => {
+    const edgeId = String(edge.edge_uid || '')
+    const source = String(edge.source_uid || '')
+    const target = String(edge.target_uid || '')
+    const edgeType = String(edge.edge_type || 'RELATED')
+    if (edgeId && source && target) {
+      edgeIdBySignature.set(comparisonEdgeSignature(source, target, edgeType), edgeId)
+    }
+  })
+  const reportUnitById = new Map(reportUnits.map((unit, index) => [unit.unitUid, { unit, index }]))
+  const degreeMap = new Map<string, number>()
+  const displayKgEdges = kgEdges.filter((edge) => {
+    const source = String(edge.source_uid || '')
+    const target = String(edge.target_uid || '')
+    return kgNodeIds.has(source) && kgNodeIds.has(target)
+  })
+  displayKgEdges.forEach((edge) => {
+    const source = String(edge.source_uid || '')
+    const target = String(edge.target_uid || '')
+    degreeMap.set(source, (degreeMap.get(source) ?? 0) + 1)
+    degreeMap.set(target, (degreeMap.get(target) ?? 0) + 1)
+  })
+
+  const entityStats = new Map<string, ComparisonOverlayStats>()
+  const relationStats = new Map<string, ComparisonOverlayStats>()
+  const unitResults = comparisonDetail?.unitResults ?? []
+
+  unitResults.forEach((unitResult) => {
+    const comparisonItems = unitResult.items.filter((item) => item.status !== 'not_applicable')
+    const itemByClauseId = new Map(comparisonItems.map((item) => [item.clauseId, item]))
+    const unitStatus = dominantComparisonStatus(
+      comparisonItems.reduce((counts, item) => {
+        counts[item.status] += 1
+        return counts
+      }, createStatusCountMap()),
+    )
+    const associatedNodeIds = new Set(
+      unitResult.graph.nodes
+        .map((node) => node.id)
+        .filter((nodeId) => kgNodeIds.has(nodeId) && nodeId !== standardId),
+    )
+    const unitRecord = reportUnitById.get(unitResult.reportUnitId)
+
+    associatedNodeIds.forEach((nodeId) => {
+      const comparisonItem = itemByClauseId.get(nodeId)
+      const status = comparisonItem?.status ?? unitStatus
+      const reason = comparisonItem?.reason ?? unitResult.summary
+      const evidence = comparisonItem?.reportEvidence ?? null
+      addComparisonOverlayStats(entityStats, nodeId, {
+        unitUid: unitResult.reportUnitId,
+        label: reportUnitMentionLabel(unitRecord?.unit, unitRecord?.index ?? 0),
+        pageSpan: unitRecord?.unit.pageSpan ?? [],
+        status,
+        reason,
+        evidence,
+        summary: unitResult.summary,
+      })
+    })
+
+    const associatedEdgeIds = new Set<string>()
+    unitResult.graph.edges.forEach((edge) => {
+      if (edge.source === standardId || edge.target === standardId) {
+        return
+      }
+      if (!kgNodeIds.has(edge.source) || !kgNodeIds.has(edge.target)) {
+        return
+      }
+      const edgeId = kgEdgeIds.has(edge.id) ? edge.id : edgeIdBySignature.get(comparisonEdgeSignature(edge.source, edge.target, edge.edgeType))
+      if (edgeId) {
+        associatedEdgeIds.add(edgeId)
+      }
+    })
+
+    associatedEdgeIds.forEach((edgeId) => {
+      addComparisonOverlayStats(relationStats, edgeId, {
+        unitUid: unitResult.reportUnitId,
+        label: reportUnitMentionLabel(unitRecord?.unit, unitRecord?.index ?? 0),
+        pageSpan: unitRecord?.unit.pageSpan ?? [],
+        status: unitStatus,
+        reason: unitResult.summary,
+        evidence: null,
+        summary: unitResult.summary,
+      })
+    })
+  })
+
+  const maxEntityFrequency = Math.max(1, ...[...entityStats.values()].map((item) => item.total))
+  const maxRelationFrequency = Math.max(1, ...[...relationStats.values()].map((item) => item.total))
+  const nodes = displayKgNodes.map((node) => {
+    const nodeId = String(node.node_uid || '')
+    const stats = entityStats.get(nodeId)
+    const status = stats ? dominantComparisonStatus(stats.statuses) : null
+    return {
+      id: nodeId,
+      label: graphNodeLabel(node),
+      nodeType: String(node.node_type || 'unknown'),
+      degree: degreeMap.get(nodeId) ?? 0,
+      properties: {
+        ...(node.properties ?? {}),
+        node_uid: nodeId,
+        node_type: node.node_type,
+        text_content: node.text_content,
+        comparison_frequency: stats?.total ?? 0,
+        comparison_status: status,
+        comparison_status_counts: stats?.statuses ?? createStatusCountMap(),
+        comparison_intensity: stats ? stats.total / maxEntityFrequency : 0,
+        report_units: stats?.units ?? [],
+      },
+    }
+  })
+
+  const edges = displayKgEdges.map((edge) => ({
+      id: String(edge.edge_uid || `${edge.source_uid}:${edge.edge_type}:${edge.target_uid}`),
+      source: String(edge.source_uid || ''),
+      target: String(edge.target_uid || ''),
+      edgeType: String(edge.edge_type || 'RELATED'),
+      properties: (() => {
+        const edgeId = String(edge.edge_uid || `${edge.source_uid}:${edge.edge_type}:${edge.target_uid}`)
+        const stats = relationStats.get(edgeId)
+        const status = stats ? dominantComparisonStatus(stats.statuses) : null
+        return {
+          ...(edge.properties ?? {}),
+          edge_uid: edge.edge_uid,
+          comparison_frequency: stats?.total ?? 0,
+          comparison_status: status,
+          comparison_status_counts: stats?.statuses ?? createStatusCountMap(),
+          comparison_intensity: stats ? stats.total / maxRelationFrequency : 0,
+          report_units: stats?.units ?? [],
+        }
+      })(),
+    }))
+
+  return {
+    standardId,
+    rootNodeId: kgNodeIds.has(standardId) ? standardId : nodes[0]?.id ?? null,
+    maxDepth: 4,
+    maxNodes: nodes.length,
+    isTruncated: false,
+    nodes,
+    edges,
+  }
+}
+
+function isReportComparisonDisplayNode(node: GraphNodeData) {
+  return REPORT_COMPARISON_DISPLAY_NODE_TYPES.has(String(node.node_type || '').trim().toLowerCase())
+}
+
+function filterComparisonGraph(
+  graph: GraphWorkbenchData | null,
+  rangeId: ComparisonGraphFrequencyRangeId,
+  statusView: ComparisonGraphStatusView,
+): GraphWorkbenchData | null {
+  if (!graph || rangeId === 'all') {
+    return graph
+  }
+
+  const range = COMPARISON_GRAPH_FREQUENCY_RANGES.find((item) => item.id === rangeId)
+  if (!range) {
+    return graph
+  }
+
+  const visibleNodeIds = new Set(
+    graph.nodes
+      .filter((node) => node.id === graph.rootNodeId || comparisonNodeMatchesRange(node, range, statusView))
+      .map((node) => node.id),
+  )
+  const edges = graph.edges.filter((edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target))
+  return {
+    ...graph,
+    nodes: graph.nodes.filter((node) => visibleNodeIds.has(node.id)),
+    edges,
+    maxNodes: visibleNodeIds.size,
+  }
+}
+
+function summarizeComparisonGraphFrequencyRanges(graph: GraphWorkbenchData | null, statusView: ComparisonGraphStatusView) {
+  const counts = COMPARISON_GRAPH_FREQUENCY_RANGES.reduce(
+    (accumulator, range) => {
+      accumulator[range.id] = 0
+      return accumulator
+    },
+    {} as Record<ComparisonGraphFrequencyRangeId, number>,
+  )
+  if (!graph) {
+    return counts
+  }
+
+  graph.nodes.forEach((node) => {
+    const frequency = getComparisonGraphNodeFrequency(node, statusView)
+    COMPARISON_GRAPH_FREQUENCY_RANGES.forEach((range) => {
+      if (frequencyInRange(frequency, range)) {
+        counts[range.id] += 1
+      }
+    })
+  })
+  return counts
+}
+
+function summarizeComparisonGraph(graph: GraphWorkbenchData | null) {
+  const statusCounts = createStatusCountMap()
+  if (!graph) {
+    return {
+      kgNodes: 0,
+      kgEdges: 0,
+      reportUnits: 0,
+      entityHits: 0,
+      relationHits: 0,
+      maxFrequency: 0,
+      statusCounts,
+    }
+  }
+
+  const reportUnitIds = new Set<string>()
+  let maxFrequency = 0
+  let entityHits = 0
+  let relationHits = 0
+
+  graph.nodes.forEach((node) => {
+    const frequency = Number(node.properties?.comparison_frequency ?? 0)
+    if (frequency <= 0) {
+      return
+    }
+    entityHits += 1
+    maxFrequency = Math.max(maxFrequency, frequency)
+
+    const status = normalizeComparisonStatus(node.properties?.comparison_status)
+    if (status) {
+      statusCounts[status] += 1
+    }
+    readReportUnitMentions(node.properties).forEach((unit) => reportUnitIds.add(unit.unitUid))
+  })
+
+  graph.edges.forEach((edge) => {
+    const frequency = Number(edge.properties?.comparison_frequency ?? 0)
+    if (frequency <= 0) {
+      return
+    }
+    relationHits += 1
+    maxFrequency = Math.max(maxFrequency, frequency)
+  })
+
+  return {
+    kgNodes: graph.nodes.length,
+    kgEdges: graph.edges.length,
+    reportUnits: reportUnitIds.size,
+    entityHits,
+    relationHits,
+    maxFrequency,
+    statusCounts,
+  }
+}
+
+function applyReportGraphStyling(runtime: RuntimeGraph, rawGraph: GraphWorkbenchData, statusView: ComparisonGraphStatusView) {
+  const maxNodeFrequency = Math.max(1, ...rawGraph.nodes.map((node) => getComparisonGraphNodeFrequency(node, statusView)))
+  const maxEdgeFrequency = Math.max(1, ...rawGraph.edges.map((edge) => getComparisonGraphEdgeFrequency(edge, statusView)))
+
+  rawGraph.nodes.forEach((node) => {
+    if (!runtime.hasNode(node.id)) {
+      return
+    }
+
+    const frequency = getComparisonGraphNodeFrequency(node, statusView)
+    if (frequency <= 0) {
+      return
+    }
+
+    const status = statusView === 'dominant' ? normalizeComparisonStatus(node.properties?.comparison_status) : statusView
+    const intensity = clampNumber(frequency / maxNodeFrequency, 0, 1)
+    runtime.mergeNodeAttributes(node.id, {
+      color: comparisonStatusColor(status ?? 'partial', intensity),
+      size: 12 + intensity * 14,
+      zIndex: 7 + Math.round(intensity * 2),
+      forceLabel: intensity > 0.55,
+    })
+  })
+
+  rawGraph.edges.forEach((edge) => {
+    if (!runtime.hasEdge(edge.id)) {
+      return
+    }
+    const frequency = getComparisonGraphEdgeFrequency(edge, statusView)
+    if (frequency <= 0) {
+      return
+    }
+    const status = statusView === 'dominant' ? normalizeComparisonStatus(edge.properties?.comparison_status) ?? 'partial' : statusView
+    const intensity = clampNumber(frequency / maxEdgeFrequency, 0, 1)
+    runtime.mergeEdgeAttributes(edge.id, {
+      color: comparisonStatusEdgeColor(status),
+      size: 1.2 + intensity * 3,
+      zIndex: 3 + Math.round(intensity * 2),
+    })
+  })
+}
+
+interface ComparisonOverlayStats {
+  total: number
+  statuses: Record<ComparisonStatus, number>
+  units: ReportUnitMention[]
+}
+
+function addComparisonOverlayStats(statsMap: Map<string, ComparisonOverlayStats>, id: string, unit: ReportUnitMention) {
+  const existing = statsMap.get(id) ?? {
+    total: 0,
+    statuses: createStatusCountMap(),
+    units: [],
+  }
+  existing.total += 1
+  existing.statuses[unit.status] += 1
+  existing.units.push(unit)
+  statsMap.set(id, existing)
+}
+
+function comparisonNodeMatchesRange(
+  node: GraphWorkbenchData['nodes'][number],
+  range: { min: number; max: number | null },
+  statusView: ComparisonGraphStatusView,
+) {
+  return frequencyInRange(getComparisonGraphNodeFrequency(node, statusView), range)
+}
+
+function getComparisonGraphNodeFrequency(node: GraphWorkbenchData['nodes'][number], statusView: ComparisonGraphStatusView) {
+  return getComparisonGraphFrequency(node.properties, statusView)
+}
+
+function getComparisonGraphEdgeFrequency(edge: GraphWorkbenchData['edges'][number], statusView: ComparisonGraphStatusView) {
+  return getComparisonGraphFrequency(edge.properties, statusView)
+}
+
+function getComparisonGraphFrequency(properties: Record<string, unknown>, statusView: ComparisonGraphStatusView) {
+  if (statusView === 'dominant') {
+    return Number(properties.comparison_frequency ?? 0)
+  }
+  return readStatusCounts(properties.comparison_status_counts)[statusView] ?? 0
+}
+
+function frequencyInRange(frequency: number, range: { min: number; max: number | null }) {
+  if (!Number.isFinite(frequency)) {
+    return false
+  }
+  if (frequency < range.min) {
+    return false
+  }
+  return range.max === null || frequency <= range.max
+}
+
+function comparisonStatusViewLabel(view: ComparisonGraphStatusView) {
+  if (view === 'dominant') {
+    return '综合'
+  }
+  return view
+}
+
+function comparisonEdgeSignature(source: string, target: string, edgeType: string) {
+  return `${source}\u0000${edgeType}\u0000${target}`
+}
+
+function reportUnitMentionLabel(unit: ReportUnitSummary | undefined, index: number) {
+  if (!unit) {
+    return `Report Unit ${index + 1}`
+  }
+  const sectionTitle = unit.sectionPath[unit.sectionPath.length - 1]
+  return unit.title || sectionTitle || `Report Unit ${index + 1}`
+}
+
+function readReportUnitMentions(properties: Record<string, unknown>): ReportUnitMention[] {
+  const rawUnits = properties.report_units
+  if (!Array.isArray(rawUnits)) {
+    return []
+  }
+  return rawUnits
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return null
+      }
+      const record = item as Record<string, unknown>
+      const status = normalizeComparisonStatus(record.status)
+      const unitUid = typeof record.unitUid === 'string' ? record.unitUid : ''
+      if (!unitUid || !status) {
+        return null
+      }
+      return {
+        unitUid,
+        label: typeof record.label === 'string' && record.label.trim() ? record.label : unitUid,
+        pageSpan: Array.isArray(record.pageSpan) ? record.pageSpan.filter((page): page is number => typeof page === 'number') : [],
+        status,
+        reason: typeof record.reason === 'string' ? record.reason : '',
+        evidence: typeof record.evidence === 'string' ? record.evidence : null,
+        summary: typeof record.summary === 'string' ? record.summary : null,
+      }
+    })
+    .filter((item): item is ReportUnitMention => item !== null)
+}
+
+function readStatusCounts(value: unknown): Record<ComparisonStatus, number> {
+  const counts = createStatusCountMap()
+  if (!value || typeof value !== 'object') {
+    return counts
+  }
+  Object.entries(value as Record<string, unknown>).forEach(([rawStatus, rawCount]) => {
+    const status = normalizeComparisonStatus(rawStatus)
+    const count = Number(rawCount ?? 0)
+    if (status && Number.isFinite(count)) {
+      counts[status] = count
+    }
+  })
+  return counts
+}
+
+function createStatusCountMap(): Record<ComparisonStatus, number> {
+  return {
+    covered: 0,
+    partial: 0,
+    missing: 0,
+    violated: 0,
+    not_applicable: 0,
+  }
+}
+
+function dominantComparisonStatus(statuses: Record<ComparisonStatus, number>): ComparisonStatus {
+  const priority: ComparisonStatus[] = ['violated', 'missing', 'partial', 'covered', 'not_applicable']
+  return priority.reduce((current, candidate) => (statuses[candidate] > statuses[current] ? candidate : current), 'not_applicable')
+}
+
+function normalizeComparisonStatus(value: unknown): ComparisonStatus | null {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  return COMPARISON_STATUSES.find((status) => status === normalized) ?? null
+}
+
+function comparisonStatusColor(status: ComparisonStatus, intensity: number) {
+  const strong = intensity >= 0.66
+  const medium = intensity >= 0.33
+  if (status === 'violated') {
+    return strong ? '#b91c1c' : medium ? '#ef4444' : '#fca5a5'
+  }
+  if (status === 'covered') {
+    return strong ? '#15803d' : medium ? '#22c55e' : '#86efac'
+  }
+  if (status === 'partial') {
+    return strong ? '#b45309' : medium ? '#f59e0b' : '#fcd34d'
+  }
+  if (status === 'missing') {
+    return strong ? '#475569' : medium ? '#94a3b8' : '#cbd5e1'
+  }
+  return '#94a3b8'
+}
+
+function comparisonStatusEdgeColor(status: ComparisonStatus) {
+  const alpha = '0.42'
+  if (status === 'violated') {
+    return `rgba(185, 28, 28, ${alpha})`
+  }
+  if (status === 'covered') {
+    return `rgba(21, 128, 61, ${alpha})`
+  }
+  if (status === 'partial') {
+    return `rgba(180, 83, 9, ${alpha})`
+  }
+  if (status === 'missing') {
+    return `rgba(71, 85, 105, ${alpha})`
+  }
+  return `rgba(100, 116, 139, ${alpha})`
+}
+
+function graphNodeLabel(node: GraphNodeData) {
+  const label = node.label ?? node.properties?.label ?? node.properties?.title ?? node.node_uid
+  return String(label || 'unnamed')
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  if (!Number.isFinite(value)) {
+    return min
+  }
+  return Math.max(min, Math.min(max, value))
 }
 
 function createReportSigmaSettings() {
@@ -580,7 +1492,14 @@ function summarizeComparison(items: ReportComparisonItem[]) {
 }
 
 function resolveNodeText(properties: Record<string, unknown>) {
+  const summary = properties.summary
   const textContent = properties.text_content
+  if (typeof summary === 'string' && summary.trim()) {
+    if (typeof textContent === 'string' && textContent.trim()) {
+      return `${summary.trim()}\n\n${textContent.trim()}`
+    }
+    return summary.trim()
+  }
   if (typeof textContent === 'string' && textContent.trim()) {
     return textContent.trim()
   }

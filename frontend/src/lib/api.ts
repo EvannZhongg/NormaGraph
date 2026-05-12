@@ -58,6 +58,8 @@ export interface ReportUnitSummary {
   unitUid: string
   parentSectionUid?: string | null
   unitType: string
+  title?: string | null
+  html?: string | null
   sectionPath: string[]
   structuralPath: string[]
   text: string
@@ -108,6 +110,7 @@ export interface ReportComparisonDetail {
   standardId: string
   status: JobStatus
   progress: number
+  processingStage?: string | null
   totalUnits: number
   completedUnits: number
   startedAt?: string | null
