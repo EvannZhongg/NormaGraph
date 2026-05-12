@@ -39,20 +39,27 @@ class ResponsesAPIClient:
         schema_name: str,
         schema: dict[str, Any],
     ) -> Any:
+        payload = self._build_base_payload(system_prompt=system_prompt, user_prompt=user_prompt)
+        payload.update(self._build_structured_output_payload(schema_name=schema_name, schema=schema))
+        data = self._send_responses_request(payload)
+        raw_text = self._extract_output_text(data)
+        return self._parse_json_output(raw_text)
+
+    def create_text_output(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> str:
+        payload = self._build_base_payload(system_prompt=system_prompt, user_prompt=user_prompt)
+        data = self._send_responses_request(payload)
+        return self._extract_output_text(data).strip()
+
+    def _build_base_payload(self, *, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         if not self.enabled:
             raise ResponseAPIError(
                 f"LLM client is not configured. Set {self.config.llm.api_key_env} in the project .env file."
             )
-
-        url = f"{self.config.llm.base_url.rstrip('/')}/responses"
-        headers = {
-            "Authorization": f"Bearer {self.config.llm.api_key}",
-            "Content-Type": "application/json",
-        }
-        if self.config.llm.organization:
-            headers["OpenAI-Organization"] = self.config.llm.organization
-        if self.config.llm.project:
-            headers["OpenAI-Project"] = self.config.llm.project
 
         payload: dict[str, Any] = {
             "model": self.config.llm.model,
@@ -69,9 +76,20 @@ class ResponsesAPIClient:
             "temperature": self.config.llm.temperature,
             "max_output_tokens": self.config.llm.max_output_tokens,
         }
-        payload.update(self._build_structured_output_payload(schema_name=schema_name, schema=schema))
         if self.config.llm.enable_thinking is not None:
             payload["enable_thinking"] = self.config.llm.enable_thinking
+        return payload
+
+    def _send_responses_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        url = f"{self.config.llm.base_url.rstrip('/')}/responses"
+        headers = {
+            "Authorization": f"Bearer {self.config.llm.api_key}",
+            "Content-Type": "application/json",
+        }
+        if self.config.llm.organization:
+            headers["OpenAI-Organization"] = self.config.llm.organization
+        if self.config.llm.project:
+            headers["OpenAI-Project"] = self.config.llm.project
 
         max_retries = max(0, self.config.llm.batch_max_retries)
         max_attempts = max_retries + 1
@@ -112,9 +130,7 @@ class ResponsesAPIClient:
         except ValueError as exc:
             raise ResponseAPIError("Responses API did not return valid JSON.") from exc
         self._raise_for_response_status(data)
-
-        raw_text = self._extract_output_text(data)
-        return self._parse_json_output(raw_text)
+        return data
 
     def _build_structured_output_payload(self, *, schema_name: str, schema: dict[str, Any]) -> dict[str, Any]:
         mode = self._structured_output_mode()

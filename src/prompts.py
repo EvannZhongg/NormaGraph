@@ -67,6 +67,16 @@ LLM_STANDARD_TITLE_CLASSIFICATION_SYSTEM_PROMPT = """你是规范标题判别器
 9. 输出必须严格满足给定 JSON Schema。"""
 
 
+LLM_CHAPTER_SUMMARY_SYSTEM_PROMPT = """你是规范章节摘要生成器，负责根据某个 chapter 下提供的规范条文，生成一个简明、保守、可读的中文摘要。
+
+要求：
+1. 只能依据输入中的 chapter 标题和条文内容总结，不能补写输入中不存在的事实、数值、范围、流程或外部背景。
+2. summary 使用中文，尽量控制在 80 到 180 字之间，概括这个 chapter 的核心主题、主要约束、检查重点或工作要求。
+3. 不要逐条抄写所有 clause，也不要输出项目符号、编号列表或引用符号。
+4. 如果输入条文较少，就基于现有内容做保守总结，不要为了凑完整而虚构。
+5. 输出必须严格满足给定 JSON Schema。"""
+
+
 def build_clause_extraction_prompt(standard_uid: str, clauses: Sequence[dict[str, Any]]) -> str:
     payload = {
         "standard_uid": standard_uid,
@@ -176,6 +186,32 @@ def build_standard_title_classification_prompt(
                 "next_block_preview": item.get("next_block_preview"),
             }
             for item in current_titles
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def build_chapter_summary_prompt(
+    standard_uid: str,
+    chapter: dict[str, Any],
+    clauses: Sequence[dict[str, Any]],
+) -> str:
+    payload = {
+        "standard_uid": standard_uid,
+        "task": "根据该 chapter 下的规范条文生成章节摘要，并用于写回 chapter 节点。",
+        "chapter": {
+            "chapter_id": chapter.get("node_uid"),
+            "ref": chapter.get("ref"),
+            "title": chapter.get("title"),
+            "raw_text": chapter.get("raw_text"),
+        },
+        "clauses": [
+            {
+                "clause_ref": clause.get("clause_ref"),
+                "clause_summary": clause.get("clause_summary"),
+                "source_text_normalized": clause.get("source_text_normalized") or clause.get("source_text"),
+            }
+            for clause in clauses
         ],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)

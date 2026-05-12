@@ -109,6 +109,8 @@ class ReportUnitSummary(BaseModel):
     unitUid: str
     parentSectionUid: str | None = None
     unitType: str
+    title: str | None = None
+    html: str | None = None
     sectionPath: list[str] = Field(default_factory=list)
     structuralPath: list[str] = Field(default_factory=list)
     text: str
@@ -148,6 +150,7 @@ class ReportUnitComparisonResult(BaseModel):
     standardId: str
     summary: str
     coverageScore: float
+    error: str | None = None
     chapterRoutingReasoning: str | None = None
     sectionRoutingReasoning: str | None = None
     matchedChapterIds: list[str] = Field(default_factory=list)
@@ -165,6 +168,7 @@ class ReportComparisonDetail(BaseModel):
     standardId: str
     status: JobStatus
     progress: float = 0.0
+    processingStage: str | None = None
     totalUnits: int = 0
     completedUnits: int = 0
     startedAt: datetime | None = None

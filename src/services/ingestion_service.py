@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures as futures
 from collections import Counter, defaultdict, deque
 import json
 from datetime import UTC, datetime
+import logging
 from pathlib import Path
 import re
 import shutil
+import time
 import uuid
 import zipfile
 from typing import Any, Sequence
@@ -47,6 +50,8 @@ GRAPH_WORKBENCH_DEFAULT_DEPTH = 2
 GRAPH_WORKBENCH_MAX_DEPTH = 4
 GRAPH_WORKBENCH_DEFAULT_NODES = 220
 GRAPH_WORKBENCH_MAX_NODES = 3000
+
+logger = logging.getLogger(__name__)
 
 
 class IngestionService:
@@ -143,6 +148,8 @@ class IngestionService:
                     "unitUid": item.get("unit_uid"),
                     "parentSectionUid": item.get("parent_section_uid"),
                     "unitType": item.get("unit_type") or "",
+                    "title": item.get("title"),
+                    "html": item.get("html"),
                     "sectionPath": item.get("section_path") or [],
                     "structuralPath": item.get("structural_path") or [],
                     "text": item.get("text") or "",
@@ -155,11 +162,10 @@ class IngestionService:
         }
 
     def get_report_comparison_detail(self, document_id: str, standard_id: str) -> dict[str, Any]:
-        comparison_path = self._report_comparison_path(document_id, standard_id)
-        if not comparison_path.exists():
+        payload = self._load_report_comparison(document_id, standard_id)
+        if payload is None:
             raise FileNotFoundError(f"Report comparison {document_id} / {standard_id} was not found.")
-        payload = json.loads(comparison_path.read_text(encoding="utf-8"))
-        return ReportComparisonDetail.model_validate(payload).model_dump(mode="json")
+        return payload
 
     def start_report_comparison(
         self,
@@ -168,9 +174,9 @@ class IngestionService:
         background_tasks: BackgroundTasks,
     ) -> dict[str, Any]:
         report_detail = self.get_report_space_detail(document_id)
-        text_units = self._list_text_report_units(report_detail)
-        if not text_units:
-            raise FileNotFoundError(f"Report {document_id} does not contain text units for comparison.")
+        evaluation_units = self._list_evaluation_report_units(report_detail)
+        if not evaluation_units:
+            raise FileNotFoundError(f"Report {document_id} does not contain evaluation units for comparison.")
 
         existing = self._load_report_comparison(document_id, standard_id)
         if existing and existing.get("status") in {"queued", "running", "succeeded"}:
@@ -182,7 +188,8 @@ class IngestionService:
             "standardId": standard_id,
             "status": "queued",
             "progress": 0.0,
-            "totalUnits": len(text_units),
+            "processingStage": "queued",
+            "totalUnits": len(evaluation_units),
             "completedUnits": 0,
             "startedAt": now,
             "updatedAt": now,
@@ -219,22 +226,32 @@ class IngestionService:
         if not chapter_candidates or not clause_candidates:
             raise FileNotFoundError(f"KG space {standard_id} does not contain enough graph data for comparison.")
 
-        agent_result = self.report_comparison_agent.compare_report_unit(
-            report_unit=report_unit,
-            standard_id=standard_id,
-            chapter_candidates=chapter_candidates,
-            section_candidates=section_candidates,
-            clause_candidates=clause_candidates,
-        )
-        return self._materialize_report_unit_result(
-            document_id=document_id,
-            report_unit=report_unit,
-            standard_id=standard_id,
-            nodes=nodes,
-            edges=edges,
-            clause_candidates=clause_candidates,
-            agent_result=agent_result,
-        )
+        try:
+            agent_result = self.report_comparison_agent.compare_report_unit(
+                report_unit=report_unit,
+                standard_id=standard_id,
+                chapter_candidates=chapter_candidates,
+                section_candidates=section_candidates,
+                clause_candidates=clause_candidates,
+            )
+            return self._materialize_report_unit_result(
+                document_id=document_id,
+                report_unit=report_unit,
+                standard_id=standard_id,
+                nodes=nodes,
+                edges=edges,
+                clause_candidates=clause_candidates,
+                agent_result=agent_result,
+            )
+        except Exception as exc:
+            return self._build_failed_report_unit_result(
+                document_id=document_id,
+                report_unit=report_unit,
+                standard_id=standard_id,
+                nodes=nodes,
+                edges=edges,
+                error=str(exc),
+            )
 
     def _run_report_comparison(self, document_id: str, standard_id: str) -> None:
         detail = self._load_report_comparison(document_id, standard_id)
@@ -243,9 +260,9 @@ class IngestionService:
 
         try:
             report_detail = self.get_report_space_detail(document_id)
-            text_units = self._list_text_report_units(report_detail)
-            if not text_units:
-                raise FileNotFoundError(f"Report {document_id} does not contain text units for comparison.")
+            evaluation_units = self._list_evaluation_report_units(report_detail)
+            if not evaluation_units:
+                raise FileNotFoundError(f"Report {document_id} does not contain evaluation units for comparison.")
 
             nodes, edges, _ = self._load_graph_records(standard_id)
             hierarchy = self._build_standard_hierarchy(nodes, edges)
@@ -255,12 +272,13 @@ class IngestionService:
             if not chapter_candidates or not clause_candidates:
                 raise FileNotFoundError(f"KG space {standard_id} does not contain enough graph data for comparison.")
 
-            section_scopes = self._build_report_section_scopes(report_detail, text_units)
-            total_steps = max(len(section_scopes) + len(text_units), 1)
+            section_scopes = self._build_report_section_scopes(report_detail, evaluation_units)
+            total_steps = max(len(section_scopes) + len(evaluation_units), 1)
             completed_steps = 0
 
             detail["status"] = "running"
-            detail["progress"] = 0.0
+            detail["progress"] = self._report_comparison_progress("routing", 0, len(section_scopes), 0, len(evaluation_units))
+            detail["processingStage"] = "routing"
             detail["completedUnits"] = 0
             detail["unitResults"] = []
             detail["items"] = []
@@ -269,68 +287,271 @@ class IngestionService:
             self._save_report_comparison(document_id, standard_id, detail)
 
             routing_by_scope: dict[str, dict[str, Any]] = {}
-            for scope in section_scopes:
-                routing = self.report_comparison_agent.route_report_scope(
-                    report_scope=scope,
+            for scope_index, routing in self._iter_concurrent_results(
+                section_scopes,
+                lambda scope: self._route_report_scope_task(
+                    document_id=document_id,
                     standard_id=standard_id,
+                    scope=scope,
                     chapter_candidates=chapter_candidates,
                     section_candidates=section_candidates,
-                )
+                ),
+                task_name="report-routing",
+            ):
+                scope = section_scopes[scope_index]
                 routing_by_scope[scope["scope_uid"]] = routing
                 completed_steps += 1
-                detail["progress"] = completed_steps / total_steps
+                detail["progress"] = self._report_comparison_progress(
+                    "routing",
+                    len(routing_by_scope),
+                    len(section_scopes),
+                    0,
+                    len(evaluation_units),
+                )
                 detail["updatedAt"] = datetime.now(UTC)
                 self._save_report_comparison(document_id, standard_id, detail)
 
-            unit_results: list[dict[str, Any]] = []
-            for report_unit in text_units:
-                route_scope_id = str(report_unit.get("parentSectionUid") or report_unit["unitUid"])
-                routing = routing_by_scope.get(route_scope_id)
-                if routing is None:
-                    raise FileNotFoundError(f"Report route {route_scope_id} was not found for {document_id}.")
-                agent_result = self.report_comparison_agent.assess_report_unit(
-                    report_unit=report_unit,
-                    standard_id=standard_id,
-                    selected_chapters=routing["selected_chapters"],
-                    selected_sections=routing["selected_sections"],
-                    clause_candidates=clause_candidates,
-                    chapter_routing_reasoning=routing["chapter_routing_reasoning"],
-                    section_routing_reasoning=routing["section_routing_reasoning"],
-                )
-                unit_result = self._materialize_report_unit_result(
+            detail["processingStage"] = "assessment"
+            detail["progress"] = self._report_comparison_progress(
+                "assessment",
+                len(section_scopes),
+                len(section_scopes),
+                0,
+                len(evaluation_units),
+            )
+            detail["updatedAt"] = datetime.now(UTC)
+            self._save_report_comparison(document_id, standard_id, detail)
+
+            unit_results_by_uid: dict[str, dict[str, Any]] = {}
+            for unit_index, unit_result in self._iter_concurrent_results(
+                evaluation_units,
+                lambda report_unit: self._assess_report_unit_task(
                     document_id=document_id,
                     report_unit=report_unit,
                     standard_id=standard_id,
                     nodes=nodes,
                     edges=edges,
                     clause_candidates=clause_candidates,
-                    agent_result=agent_result,
-                )
-                unit_results.append(unit_result)
+                    routing_by_scope=routing_by_scope,
+                ),
+                task_name="report-assessment",
+            ):
+                report_unit = evaluation_units[unit_index]
+                unit_results_by_uid[str(report_unit["unitUid"])] = unit_result
+                unit_results = [
+                    unit_results_by_uid[str(item["unitUid"])]
+                    for item in evaluation_units
+                    if str(item["unitUid"]) in unit_results_by_uid
+                ]
                 completed_steps += 1
-                detail["completedUnits"] = len(unit_results)
-                detail["progress"] = completed_steps / total_steps
+                detail["completedUnits"] = len(unit_results_by_uid)
+                detail["progress"] = self._report_comparison_progress(
+                    "assessment",
+                    len(section_scopes),
+                    len(section_scopes),
+                    len(unit_results_by_uid),
+                    len(evaluation_units),
+                )
                 detail["unitResults"] = unit_results
                 detail["updatedAt"] = datetime.now(UTC)
                 self._save_report_comparison(document_id, standard_id, detail)
 
+            unit_results = [
+                unit_results_by_uid[str(item["unitUid"])]
+                for item in evaluation_units
+                if str(item["unitUid"]) in unit_results_by_uid
+            ]
+            detail["processingStage"] = "finalizing"
+            detail["progress"] = self._report_comparison_progress(
+                "finalizing",
+                len(section_scopes),
+                len(section_scopes),
+                len(unit_results),
+                len(evaluation_units),
+            )
+            detail["unitResults"] = unit_results
+            detail["updatedAt"] = datetime.now(UTC)
+            self._save_report_comparison(document_id, standard_id, detail)
+
             aggregate = self._aggregate_report_comparison(unit_results, clause_candidates)
-            detail["status"] = "succeeded"
+            failed_unit_count = sum(1 for item in unit_results if item.get("error"))
+            detail["status"] = "failed" if failed_unit_count >= len(unit_results) and unit_results else "succeeded"
             detail["progress"] = 1.0
+            detail["processingStage"] = "completed"
             detail["summary"] = aggregate["summary"]
             detail["coverageScore"] = aggregate["coverageScore"]
             detail["matchedChapterIds"] = aggregate["matchedChapterIds"]
             detail["matchedSectionIds"] = aggregate["matchedSectionIds"]
             detail["items"] = aggregate["items"]
+            detail["error"] = (
+                f"{failed_unit_count} report unit(s) failed during evaluation."
+                if failed_unit_count and failed_unit_count >= len(unit_results)
+                else None
+            )
             detail["completedAt"] = datetime.now(UTC)
             detail["updatedAt"] = detail["completedAt"]
             self._save_report_comparison(document_id, standard_id, detail)
         except Exception as exc:
             detail["status"] = "failed"
+            detail["processingStage"] = "failed"
             detail["error"] = str(exc)
             detail["updatedAt"] = datetime.now(UTC)
             self._save_report_comparison(document_id, standard_id, detail)
             raise
+
+    def _route_report_scope_task(
+        self,
+        *,
+        document_id: str,
+        standard_id: str,
+        scope: dict[str, Any],
+        chapter_candidates: list[dict[str, Any]],
+        section_candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        try:
+            return self.report_comparison_agent.route_report_scope(
+                report_scope=scope,
+                standard_id=standard_id,
+                chapter_candidates=chapter_candidates,
+                section_candidates=section_candidates,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Report comparison routing failed for %s scope %s: %s",
+                document_id,
+                scope.get("scope_uid"),
+                exc,
+            )
+            return {
+                "error": str(exc),
+                "chapter_ids": [],
+                "section_ids": [],
+                "selected_chapters": [],
+                "selected_sections": [],
+                "chapter_routing_reasoning": "",
+                "section_routing_reasoning": "",
+            }
+
+    def _assess_report_unit_task(
+        self,
+        *,
+        document_id: str,
+        report_unit: dict[str, Any],
+        standard_id: str,
+        nodes: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+        clause_candidates: list[dict[str, Any]],
+        routing_by_scope: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        route_scope_id = str(report_unit.get("parentSectionUid") or report_unit["unitUid"])
+        routing = routing_by_scope.get(route_scope_id)
+        if routing is None:
+            return self._build_failed_report_unit_result(
+                document_id=document_id,
+                report_unit=report_unit,
+                standard_id=standard_id,
+                nodes=nodes,
+                edges=edges,
+                error=f"Report route {route_scope_id} was not found for {document_id}.",
+            )
+        if routing.get("error"):
+            return self._build_failed_report_unit_result(
+                document_id=document_id,
+                report_unit=report_unit,
+                standard_id=standard_id,
+                nodes=nodes,
+                edges=edges,
+                error=str(routing.get("error") or ""),
+            )
+
+        try:
+            agent_result = self.report_comparison_agent.assess_report_unit(
+                report_unit=report_unit,
+                standard_id=standard_id,
+                selected_chapters=routing["selected_chapters"],
+                selected_sections=routing["selected_sections"],
+                clause_candidates=clause_candidates,
+                chapter_routing_reasoning=routing["chapter_routing_reasoning"],
+                section_routing_reasoning=routing["section_routing_reasoning"],
+            )
+            return self._materialize_report_unit_result(
+                document_id=document_id,
+                report_unit=report_unit,
+                standard_id=standard_id,
+                nodes=nodes,
+                edges=edges,
+                clause_candidates=clause_candidates,
+                agent_result=agent_result,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Report comparison assessment failed for %s unit %s: %s",
+                document_id,
+                report_unit.get("unitUid"),
+                exc,
+            )
+            return self._build_failed_report_unit_result(
+                document_id=document_id,
+                report_unit=report_unit,
+                standard_id=standard_id,
+                nodes=nodes,
+                edges=edges,
+                error=str(exc),
+                matched_chapter_ids=routing.get("chapter_ids") or [],
+                matched_section_ids=routing.get("section_ids") or [],
+                chapter_routing_reasoning=str(routing.get("chapter_routing_reasoning") or ""),
+                section_routing_reasoning=str(routing.get("section_routing_reasoning") or ""),
+            )
+
+    def _iter_concurrent_results(
+        self,
+        items: Sequence[Any],
+        worker: Any,
+        *,
+        task_name: str,
+    ) -> Sequence[tuple[int, Any]]:
+        if not items:
+            return []
+
+        max_concurrency = max(1, min(self.config.llm.batch_max_concurrency, len(items)))
+        logger.info(
+            "Running %s %s task(s) with concurrency=%s.",
+            len(items),
+            task_name,
+            max_concurrency,
+        )
+        if max_concurrency == 1:
+            return [(index, worker(item)) for index, item in enumerate(items)]
+
+        results: list[tuple[int, Any]] = []
+        with futures.ThreadPoolExecutor(max_workers=max_concurrency, thread_name_prefix=task_name) as executor:
+            submitted = {
+                executor.submit(worker, item): index
+                for index, item in enumerate(items)
+            }
+            for future in futures.as_completed(submitted):
+                results.append((submitted[future], future.result()))
+        return results
+
+    def _report_comparison_progress(
+        self,
+        stage: str,
+        routing_completed: int,
+        routing_total: int,
+        assessment_completed: int,
+        assessment_total: int,
+    ) -> float:
+        routing_total = max(routing_total, 1)
+        assessment_total = max(assessment_total, 1)
+        if stage == "routing":
+            return round(0.08 + 0.37 * min(1.0, routing_completed / routing_total), 4)
+        if stage == "assessment":
+            return round(0.45 + 0.5 * min(1.0, assessment_completed / assessment_total), 4)
+        if stage == "finalizing":
+            return 0.98
+        if stage == "completed":
+            return 1.0
+        return 0.0
 
     def list_documents(self) -> list[DocumentSummary]:
         documents: dict[str, DocumentSummary] = {}
@@ -1068,6 +1289,7 @@ class IngestionService:
                         "ref": properties.get("ref"),
                         "label": self._graph_node_label(node),
                         "title": properties.get("title") or self._graph_node_label(node),
+                        "summary": properties.get("summary") or "",
                     }
                 )
             elif node_type == "section":
@@ -1128,9 +1350,9 @@ class IngestionService:
             "clauses": clauses,
         }
 
-    def _list_text_report_units(self, report_detail: dict[str, Any]) -> list[dict[str, Any]]:
+    def _list_evaluation_report_units(self, report_detail: dict[str, Any]) -> list[dict[str, Any]]:
         return sorted(
-            [item for item in report_detail["reportUnits"] if item.get("unitType") == "text"],
+            [item for item in report_detail["reportUnits"] if item.get("unitType") in {"text", "table"}],
             key=lambda item: (int(item.get("orderIndex") or 0), str(item.get("unitUid") or "")),
         )
 
@@ -1172,7 +1394,14 @@ class IngestionService:
         units: list[dict[str, Any]],
     ) -> dict[str, Any]:
         ordered_units = sorted(units, key=lambda item: (int(item.get("orderIndex") or 0), str(item.get("unitUid") or "")))
-        text_parts = [str(item.get("textNormalized") or item.get("text") or "").strip() for item in ordered_units]
+        text_parts = [
+            str(
+                item.get("html")
+                if item.get("unitType") == "table"
+                else (item.get("textNormalized") or item.get("text") or "")
+            ).strip()
+            for item in ordered_units
+        ]
         page_values = [int(page) for item in ordered_units for page in (item.get("pageSpan") or []) if isinstance(page, int)]
         section_path = list(section.get("path") or []) if section else list(ordered_units[0].get("sectionPath") or [])
         title = (
@@ -1223,6 +1452,7 @@ class IngestionService:
         graph = self._build_report_comparison_graph(
             document_id=document_id,
             report_unit=report_unit,
+            report_summary=agent_result["summary"],
             standard_id=standard_id,
             nodes=nodes,
             edges=edges,
@@ -1237,6 +1467,7 @@ class IngestionService:
             "standardId": standard_id,
             "summary": agent_result["summary"],
             "coverageScore": agent_result["coverage_score"],
+            "error": None,
             "chapterRoutingReasoning": agent_result["chapter_routing_reasoning"],
             "sectionRoutingReasoning": agent_result["section_routing_reasoning"],
             "matchedChapterIds": agent_result["chapter_ids"],
@@ -1283,7 +1514,8 @@ class IngestionService:
             )
 
         coverage_score = self._compute_report_coverage_score(aggregated_items)
-        summary = self._build_report_comparison_summary(aggregated_items)
+        failed_unit_count = sum(1 for item in unit_results if item.get("error"))
+        summary = self._build_report_comparison_summary(aggregated_items, failed_unit_count=failed_unit_count)
         return {
             "summary": summary,
             "coverageScore": coverage_score,
@@ -1317,13 +1549,57 @@ class IngestionService:
                 score += 0.5
         return round(score / len(applicable_items), 4)
 
-    def _build_report_comparison_summary(self, items: list[dict[str, Any]]) -> str:
+    def _build_report_comparison_summary(self, items: list[dict[str, Any]], failed_unit_count: int = 0) -> str:
         counts = Counter(str(item.get("status") or "") for item in items)
-        return (
+        summary = (
             f"covered={counts.get('covered', 0)}, partial={counts.get('partial', 0)}, "
             f"missing={counts.get('missing', 0)}, violated={counts.get('violated', 0)}, "
             f"not_applicable={counts.get('not_applicable', 0)}"
         )
+        if failed_unit_count > 0:
+            summary += f", failed_units={failed_unit_count}"
+        return summary
+
+    def _build_failed_report_unit_result(
+        self,
+        *,
+        document_id: str,
+        report_unit: dict[str, Any],
+        standard_id: str,
+        nodes: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+        error: str,
+        matched_chapter_ids: Sequence[str] | None = None,
+        matched_section_ids: Sequence[str] | None = None,
+        chapter_routing_reasoning: str = "",
+        section_routing_reasoning: str = "",
+    ) -> dict[str, Any]:
+        message = str(error).strip() or "Unknown report comparison error."
+        return {
+            "documentId": document_id,
+            "reportUnitId": report_unit["unitUid"],
+            "parentSectionUid": report_unit.get("parentSectionUid"),
+            "standardId": standard_id,
+            "summary": f"Evaluation failed after retries: {message}",
+            "coverageScore": 0.0,
+            "error": message,
+            "chapterRoutingReasoning": chapter_routing_reasoning or None,
+            "sectionRoutingReasoning": section_routing_reasoning or None,
+            "matchedChapterIds": [str(item) for item in (matched_chapter_ids or []) if str(item)],
+            "matchedSectionIds": [str(item) for item in (matched_section_ids or []) if str(item)],
+            "items": [],
+            "graph": self._build_report_comparison_graph(
+                document_id=document_id,
+                report_unit=report_unit,
+                report_summary=f"Evaluation failed after retries: {message}",
+                standard_id=standard_id,
+                nodes=nodes,
+                edges=edges,
+                matched_chapter_ids=[str(item) for item in (matched_chapter_ids or []) if str(item)],
+                matched_section_ids=[str(item) for item in (matched_section_ids or []) if str(item)],
+                comparison_items=[],
+            ),
+        }
 
     def _report_comparison_dir(self, document_id: str) -> Path:
         report_space_dir = self.config.report_space_dir_for(document_id)
@@ -1341,18 +1617,85 @@ class IngestionService:
         path = self._report_comparison_path(document_id, standard_id)
         if not path.exists():
             return None
-        return ReportComparisonDetail.model_validate(json.loads(path.read_text(encoding="utf-8"))).model_dump(mode="json")
+        payload = self._read_json_file_with_retries(path)
+        return ReportComparisonDetail.model_validate(payload).model_dump(mode="json")
 
     def _save_report_comparison(self, document_id: str, standard_id: str, payload: dict[str, Any]) -> None:
         path = self._report_comparison_path(document_id, standard_id)
         validated = ReportComparisonDetail.model_validate(payload)
-        path.write_text(validated.model_dump_json(indent=2), encoding="utf-8")
+        self._write_text_atomic(path, validated.model_dump_json(indent=2))
+
+    def _read_json_file_with_retries(
+        self,
+        path: Path,
+        *,
+        retries: int = 8,
+        delay_seconds: float = 0.05,
+    ) -> Any:
+        last_error: Exception | None = None
+        attempts = max(1, retries + 1)
+        for attempt in range(1, attempts + 1):
+            try:
+                raw_text = path.read_text(encoding="utf-8")
+            except (FileNotFoundError, PermissionError) as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    break
+                time.sleep(delay_seconds * attempt)
+                continue
+            if raw_text.strip():
+                try:
+                    return json.loads(raw_text)
+                except json.JSONDecodeError as exc:
+                    last_error = exc
+            else:
+                last_error = json.JSONDecodeError("Expecting value", raw_text, 0)
+
+            if attempt >= attempts:
+                break
+            time.sleep(delay_seconds * attempt)
+
+        logger.warning(
+            "Failed to read valid JSON from %s after %s attempt(s): %s",
+            path,
+            attempts,
+            last_error,
+        )
+        if last_error is not None:
+            raise last_error
+        raise json.JSONDecodeError("Expecting value", "", 0)
+
+    def _write_text_atomic(
+        self,
+        path: Path,
+        content: str,
+        *,
+        replace_retries: int = 12,
+        replace_delay_seconds: float = 0.05,
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp_path.write_text(content, encoding="utf-8")
+            attempts = max(1, replace_retries + 1)
+            for attempt in range(1, attempts + 1):
+                try:
+                    temp_path.replace(path)
+                    break
+                except PermissionError:
+                    if attempt >= attempts:
+                        raise
+                    time.sleep(replace_delay_seconds * attempt)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
 
     def _build_report_comparison_graph(
         self,
         *,
         document_id: str,
         report_unit: dict[str, Any],
+        report_summary: str,
         standard_id: str,
         nodes: list[dict[str, Any]],
         edges: list[dict[str, Any]],
@@ -1390,7 +1733,12 @@ class IngestionService:
                 "properties": {
                     "document_id": document_id,
                     "unit_uid": report_unit["unitUid"],
-                    "text_content": report_unit.get("textNormalized") or report_unit.get("text") or "",
+                    "summary": report_summary,
+                    "text_content": (
+                        report_unit.get("html")
+                        if report_unit.get("unitType") == "table"
+                        else (report_unit.get("textNormalized") or report_unit.get("text") or "")
+                    ),
                     "section_path": report_unit.get("sectionPath") or [],
                 },
                 "degree": 0,

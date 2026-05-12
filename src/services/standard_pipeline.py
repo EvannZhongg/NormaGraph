@@ -13,6 +13,7 @@ from typing import Any
 from adapters.llm_client import EmbeddingsAPIClient, ResponsesAPIClient
 from core.config import AppConfig, get_config
 from repositories.postgres_graph_store import PostgresGraphStore
+from services.chapter_summary_service import ChapterSummaryService
 from services.graph_materialization import GraphMaterializationService
 from services.llm_extraction import LLMGraphExtractionService
 from services.standard_title_classification import StandardTitleClassificationService
@@ -70,6 +71,7 @@ class StandardPipelineService:
         config: AppConfig | None = None,
         llm_extraction_service: LLMGraphExtractionService | None = None,
         title_classification_service: StandardTitleClassificationService | None = None,
+        chapter_summary_service: ChapterSummaryService | None = None,
         graph_materialization_service: GraphMaterializationService | None = None,
         embedding_client: EmbeddingsAPIClient | None = None,
         postgres_graph_store: PostgresGraphStore | None = None,
@@ -77,22 +79,23 @@ class StandardPipelineService:
         self.config = config or get_config()
         llm_client = ResponsesAPIClient(self.config)
         self.llm_extraction_service = llm_extraction_service or LLMGraphExtractionService(self.config, llm_client)
+        self.chapter_summary_service = chapter_summary_service or ChapterSummaryService(self.config, llm_client)
         self.title_classification_service = title_classification_service or StandardTitleClassificationService(self.config, ResponsesAPIClient(self.config))
         self.graph_materialization_service = graph_materialization_service or GraphMaterializationService(self.config)
         self.embedding_client = embedding_client or EmbeddingsAPIClient(self.config)
         self.postgres_graph_store = postgres_graph_store or PostgresGraphStore(self.config)
 
     def run(self, artifact_dir: Path, standard_uid: str) -> PipelineOutput:
-        content_list_path = artifact_dir / 'content_list_v2.json'
-        if not content_list_path.exists():
-            raise FileNotFoundError(f'content_list_v2.json was not found in {artifact_dir}')
+        content_list_path = self._resolve_content_list_path(artifact_dir)
 
         data = json.loads(content_list_path.read_text(encoding='utf-8'))
         normalized_blocks = self._flatten_content_list(data)
         structure_nodes, clauses, metrics, structure_warnings = self._build_structure(normalized_blocks, standard_uid)
         requirements, extraction_metrics, extraction_warnings = self._extract_requirements(clauses, standard_uid)
-        extraction_warnings = [*structure_warnings, *extraction_warnings]
+        chapter_summary_metrics, chapter_summary_warnings = self._generate_chapter_summaries(structure_nodes, clauses, standard_uid)
+        extraction_warnings = [*structure_warnings, *extraction_warnings, *chapter_summary_warnings]
         metrics.update(extraction_metrics)
+        metrics.update(chapter_summary_metrics)
         metrics['requirement_count'] = len(requirements)
         metrics['clauses_with_requirements'] = sum(1 for clause in clauses if clause.get('requirement_count', 0) > 0)
 
@@ -134,6 +137,15 @@ class StandardPipelineService:
             metrics=metrics,
             report_markdown=report_markdown,
         )
+
+    def _resolve_content_list_path(self, artifact_dir: Path) -> Path:
+        content_list_path = artifact_dir / 'content_list_v2.json'
+        if content_list_path.exists():
+            return content_list_path
+        prefixed_matches = sorted(artifact_dir.glob('*_content_list_v2.json'))
+        if prefixed_matches:
+            return prefixed_matches[0]
+        raise FileNotFoundError(f'content_list_v2.json was not found in {artifact_dir}')
 
     def write_outputs(
         self,
@@ -514,6 +526,28 @@ class StandardPipelineService:
         if not llm_requirements and should_fallback:
             metrics['extraction_mode_effective'] = 'heuristic'
         return llm_requirements, metrics, warnings
+
+    def _generate_chapter_summaries(
+        self,
+        structure_nodes: list[dict[str, Any]],
+        clauses: list[dict[str, Any]],
+        standard_uid: str,
+    ) -> tuple[dict[str, Any], list[str]]:
+        result = self.chapter_summary_service.summarize_chapters(
+            standard_uid=standard_uid,
+            structure_nodes=structure_nodes,
+            clauses=clauses,
+        )
+        for node in structure_nodes:
+            if node.get('node_type') != 'chapter':
+                continue
+            item = result.chapter_items.get(node['node_uid'])
+            if item is None:
+                continue
+            node['summary'] = item.get('summary', '')
+            node['summary_source_clause_count'] = item.get('summary_source_clause_count', 0)
+            node['summary_source_truncated'] = bool(item.get('summary_source_truncated'))
+        return result.metrics, result.warnings
 
     def _extract_requirements_heuristic(self, clauses: list[dict[str, Any]], standard_uid: str) -> list[dict[str, Any]]:
         requirements: list[dict[str, Any]] = []
@@ -1189,6 +1223,8 @@ class StandardPipelineService:
             f'- Appendix clauses: {metrics["appendix_clause_count"]}',
             f'- Requirements: {metrics["requirement_count"]}',
             f'- Clauses with requirements: {metrics["clauses_with_requirements"]}',
+            f'- Chapter summaries: {metrics.get("chapter_summary_completed_count", 0)}/{metrics.get("chapter_summary_requested_count", 0)}',
+            f'- Chapter summary status: {metrics.get("chapter_summary_status", "n/a")}',
             f'- Graph nodes: {metrics.get("graph_node_count", 0)}',
             f'- Graph edges: {metrics.get("graph_edge_count", 0)}',
             f'- Embedding docs: {metrics.get("embedding_document_count", 0)}',

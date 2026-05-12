@@ -215,6 +215,11 @@ def build_router(ingestion_service: IngestionService) -> APIRouter:
             return ReportComparisonDetail(**ingestion_service.get_report_comparison_detail(document_id, standard_id))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Report comparison {document_id} / {standard_id} is being updated. Please retry.",
+            ) from exc
 
     @router.post("/v1/report-spaces/{document_id}/units/{unit_uid}/compare", response_model=ReportComparisonResponse)
     async def compare_report_unit(document_id: str, unit_uid: str, request: ReportComparisonRequest) -> ReportComparisonResponse:

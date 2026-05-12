@@ -93,6 +93,33 @@ class StandardPipelineLLMTitleTest(unittest.TestCase):
         self.assertEqual(clauses["sl-test:2026:main:1.0.1"]["chapter_ref"], "1")
         self.assertEqual(clauses["sl-test:2026:main:2.0.1"]["chapter_ref"], "2")
 
+    def test_pipeline_accepts_prefixed_content_list_v2_file(self) -> None:
+        content_list_path = self.artifact_dir / "content_list_v2.json"
+        prefixed_path = self.artifact_dir / "6799bb12-32ae-45c0-ac6a-9eaf395f0a35_content_list_v2.json"
+        content_list_path.rename(prefixed_path)
+
+        config = get_config().model_copy(deep=True)
+        config.llm.enabled = True
+        config.embedding.enabled = False
+        config.postgres.enabled = False
+        config.knowledge_graph.materialize_graph = False
+        config.knowledge_graph.extraction_mode = "heuristic"
+
+        classifier = StubStandardTitleClassifier(
+            items=[
+                {"title_id": "p001-b001", "label": "chapter", "confidence": 0.99, "rationale": "一级章节"},
+                {"title_id": "p001-b002", "label": "clause", "confidence": 0.98, "rationale": "条文误识别为标题"},
+                {"title_id": "p001-b003", "label": "reference_standard", "confidence": 0.99, "rationale": "规范性引用文件"},
+                {"title_id": "p001-b004", "label": "clause", "confidence": 0.98, "rationale": "条文误识别为标题"},
+                {"title_id": "p001-b005", "label": "appendix", "confidence": 0.99, "rationale": "附录标题"},
+            ]
+        )
+        service = StandardPipelineService(config=config, title_classification_service=classifier)
+        output = service.run(self.artifact_dir, "sl-test:2026")
+
+        self.assertGreater(output.metrics["normalized_block_count"], 0)
+        self.assertEqual(output.structure_nodes[0]["node_type"], "chapter")
+
     @staticmethod
     def _title(text: str) -> dict:
         return {

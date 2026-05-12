@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import re
+import time
 from typing import Any
 
 from adapters.llm_client import ResponseAPIError, ResponsesAPIClient
@@ -65,6 +66,15 @@ CLAUSE_ASSESSMENT_SCHEMA: dict[str, Any] = {
     "required": ["summary", "coverage_score", "items"],
 }
 
+VIOLATED_SUMMARY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "summary": {"type": "string"},
+    },
+    "required": ["summary"],
+}
+
 
 def build_report_chapter_routing_system_prompt() -> str:
     return """你是水利水电报告比对代理中的章节路由器。
@@ -73,10 +83,11 @@ def build_report_chapter_routing_system_prompt() -> str:
 1. 根据报告分块文本，从候选规范 chapter 中选择最相关的章节。
 2. 只选择后续值得深入比对的章节，通常 1 到 4 个。
 3. 优先依据语义主题、工程对象、安全类别、检查事项来选择，不要机械依赖关键词单字重合。
-4. 如果报告分块涉及缺陷、措施、结论、监测、复核等内容，也要映射到真正约束该内容的规范章节。
-5. 输出中的 chapter id 必须直接复制自输入 `candidate_chapters[].id`，不得改写、缩写、解释或生成新 id。
-6. `reasoning` 只写简短中文说明，不要粘贴原文，不要使用双引号，不要输出嵌套对象。
-7. 输出必须严格满足给定 JSON Schema。"""
+4. 候选 chapter 中如果提供 `summary` 字段，应把它作为章节内容摘要参考，与标题一起综合判断。
+5. 如果报告分块涉及缺陷、措施、结论、监测、复核等内容，也要映射到真正约束该内容的规范章节。
+6. 输出中的 chapter id 必须直接复制自输入 `candidate_chapters[].id`，不得改写、缩写、解释或生成新 id。
+7. `reasoning` 只写简短中文说明，不要粘贴原文，不要使用双引号，不要输出嵌套对象。
+8. 输出必须严格满足给定 JSON Schema。"""
 
 
 def build_report_section_routing_system_prompt() -> str:
@@ -100,12 +111,36 @@ def build_report_clause_assessment_system_prompt() -> str:
 3. `partial` 表示报告只覆盖了一部分要求，仍有明显缺口。
 4. `missing` 表示候选条款要求在报告分块中没有体现。
 5. `violated` 表示报告分块明确出现了与条款要求相冲突、相反或明显不满足的表述。
-6. `not_applicable` 只在该条款与当前报告分块显然无关时使用。
-7. 必须尽量引用报告分块中的具体语句作为 `report_evidence`；没有明确证据时可返回 null。
-8. `coverage_score` 取 0 到 1 之间的小数，表示该分块对当前候选条款集合的总体覆盖程度。
-9. `clause_id` 必须直接复制自输入 `candidate_clauses[].id`，不得改写。
-10. `summary` 和 `reason` 都只写简短中文说明，不要粘贴带双引号的原文；如需引用原文，优先放在 `report_evidence`，且避免使用双引号。
-11. 输出必须严格满足给定 JSON Schema。"""
+6. `selected_chapters` 中如果提供 `summary` 字段，可将其作为章节范围和规范主题的参考背景，但不得用它替代对候选条款文本本身的判断。
+7. `not_applicable` 只在该条款与当前报告分块显然无关时使用。
+8. 必须尽量引用报告分块中的具体语句作为 `report_evidence`；没有明确证据时可返回 null。
+9. `coverage_score` 取 0 到 1 之间的小数，表示该分块对当前候选条款集合的总体覆盖程度。
+10. `clause_id` 必须直接复制自输入 `candidate_clauses[].id`，不得改写。
+11. `summary` 和 `reason` 都只写简短中文说明，不要粘贴带双引号的原文；如需引用原文，优先放在 `report_evidence`，且避免使用双引号。
+12. 输出必须严格满足给定 JSON Schema。"""
+
+
+def build_report_violated_summary_system_prompt() -> str:
+    return """你是水利水电报告规范比对中的缺陷摘要器。
+
+任务：
+1. 当当前报告分块已经被判定存在 `violated` 条款时，根据报告文本、已选规范范围和违反项，生成一段简短中文缺陷摘要。
+2. 摘要要优先指出违反了什么类型的具体规范要求、报告里体现出的主要缺陷是什么，以及可能带来的直接风险或管理问题。
+3. 只能依据输入内容总结，不能补写输入中不存在的事实、结论、数值或整改措施。
+4. 摘要控制在 60 到 160 字之间，不要输出项目符号、编号列表或 JSON 片段。
+5. 如果存在 `report_evidence`，可据此概括缺陷，但不要大段照抄原文。
+6. 输出必须严格满足给定 JSON Schema。"""
+
+
+def build_report_violated_summary_text_system_prompt() -> str:
+    return """你是水利水电报告规范比对中的缺陷摘要器。
+
+任务：
+1. 当当前报告分块已经被判定存在 `violated` 条款时，根据报告文本、已选规范范围和违反项，生成一段简短中文缺陷摘要。
+2. 摘要要优先指出违反了什么类型的具体规范要求、报告里体现出的主要缺陷是什么，以及可能带来的直接风险或管理问题。
+3. 只能依据输入内容总结，不能补写输入中不存在的事实、结论、数值或整改措施。
+4. 摘要控制在 60 到 160 字之间。
+5. 直接输出摘要正文，不要输出 JSON、代码块、项目符号、编号列表或额外说明。"""
 
 
 def build_report_chapter_routing_prompt(report_unit: dict[str, Any], chapters: list[dict[str, Any]]) -> str:
@@ -150,13 +185,35 @@ def build_report_clause_assessment_prompt(
     )
 
 
+def build_report_violated_summary_prompt(
+    report_unit: dict[str, Any],
+    chapters: list[dict[str, Any]],
+    sections: list[dict[str, Any]],
+    violated_items: list[dict[str, Any]],
+) -> str:
+    return _json_payload(
+        {
+            "task": "根据当前报告分块中的 violated 条款，生成指出主要缺陷的简短摘要。",
+            "report_unit": _report_scope_payload(report_unit),
+            "selected_chapters": chapters,
+            "selected_sections": sections,
+            "violated_items": violated_items,
+        }
+    )
+
+
 def _report_scope_payload(report_unit: dict[str, Any]) -> dict[str, Any]:
+    report_text = (
+        report_unit.get("html")
+        if report_unit.get("unit_type") == "table" or report_unit.get("unitType") == "table"
+        else (report_unit.get("text_normalized") or report_unit.get("textNormalized") or report_unit.get("text"))
+    )
     return {
         "unit_uid": report_unit.get("unit_uid") or report_unit.get("scope_uid"),
         "title": report_unit.get("title"),
         "section_path": report_unit.get("section_path", []),
         "structural_path": report_unit.get("structural_path", []),
-        "text": report_unit.get("text_normalized") or report_unit.get("text"),
+        "text": report_text,
         "page_span": report_unit.get("source_page_span") or report_unit.get("page_span"),
     }
 
@@ -214,43 +271,59 @@ class ReportComparisonAgentService:
         chapter_candidates: list[dict[str, Any]],
         section_candidates: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        chapter_result = self.client.create_structured_output(
-            system_prompt=build_report_chapter_routing_system_prompt(),
-            user_prompt=build_report_chapter_routing_prompt(report_scope, chapter_candidates),
-            schema_name="report_comparison_chapter_routing",
-            schema=CHAPTER_ROUTING_SCHEMA,
+        def resolve_chapter_routing() -> tuple[dict[str, Any], list[str]]:
+            chapter_result = self.client.create_structured_output(
+                system_prompt=build_report_chapter_routing_system_prompt(),
+                user_prompt=build_report_chapter_routing_prompt(report_scope, chapter_candidates),
+                schema_name="report_comparison_chapter_routing",
+                schema=CHAPTER_ROUTING_SCHEMA,
+            )
+            chapter_ids = self._normalize_ids(
+                chapter_result.get("chapter_ids")
+                or chapter_result.get("selected_chapter_ids")
+                or chapter_result.get("selected_chapters"),
+                chapter_candidates,
+                "chapter_id",
+            )
+            if not chapter_ids:
+                raise ResponseAPIError(f"Report comparison returned no chapter candidates for {standard_id}.")
+            return chapter_result, chapter_ids
+
+        chapter_result, chapter_ids = self._run_stage_with_format_retries(
+            stage_name="chapter_routing",
+            standard_id=standard_id,
+            operation=resolve_chapter_routing,
         )
-        chapter_ids = self._normalize_ids(
-            chapter_result.get("chapter_ids")
-            or chapter_result.get("selected_chapter_ids")
-            or chapter_result.get("selected_chapters"),
-            chapter_candidates,
-            "chapter_id",
-        )
-        if not chapter_ids:
-            raise ResponseAPIError(f"Report comparison returned no chapter candidates for {standard_id}.")
 
         selected_chapters = [item for item in chapter_candidates if item["id"] in chapter_ids]
         selected_sections_source = [
             item for item in section_candidates if item.get("chapter_id") in chapter_ids or item["id"] in chapter_ids
         ]
-        section_result = self.client.create_structured_output(
-            system_prompt=build_report_section_routing_system_prompt(),
-            user_prompt=build_report_section_routing_prompt(report_scope, selected_chapters, selected_sections_source),
-            schema_name="report_comparison_section_routing",
-            schema=SECTION_ROUTING_SCHEMA,
+        def resolve_section_routing() -> tuple[dict[str, Any], list[str]]:
+            section_result = self.client.create_structured_output(
+                system_prompt=build_report_section_routing_system_prompt(),
+                user_prompt=build_report_section_routing_prompt(report_scope, selected_chapters, selected_sections_source),
+                schema_name="report_comparison_section_routing",
+                schema=SECTION_ROUTING_SCHEMA,
+            )
+            section_ids = self._normalize_ids(
+                section_result.get("section_ids")
+                or section_result.get("selected_section_ids")
+                or section_result.get("selected_sections")
+                or section_result.get("sections"),
+                selected_sections_source,
+                "section_id",
+            )
+            if not section_ids:
+                logger.warning("Report comparison section routing returned no normalized ids for %s. Raw payload: %s", standard_id, section_result)
+                raise ResponseAPIError(f"Report comparison returned no section candidates for {standard_id}.")
+            return section_result, section_ids
+
+        section_result, section_ids = self._run_stage_with_format_retries(
+            stage_name="section_routing",
+            standard_id=standard_id,
+            operation=resolve_section_routing,
         )
-        section_ids = self._normalize_ids(
-            section_result.get("section_ids")
-            or section_result.get("selected_section_ids")
-            or section_result.get("selected_sections")
-            or section_result.get("sections"),
-            selected_sections_source,
-            "section_id",
-        )
-        if not section_ids:
-            logger.warning("Report comparison section routing returned no normalized ids for %s. Raw payload: %s", standard_id, section_result)
-            raise ResponseAPIError(f"Report comparison returned no section candidates for {standard_id}.")
 
         selected_sections = [item for item in selected_sections_source if item["id"] in section_ids]
         return {
@@ -279,30 +352,47 @@ class ReportComparisonAgentService:
         if not selected_clauses:
             raise ResponseAPIError(f"No clause candidates were found under selected sections for {standard_id}.")
 
-        assessment_result = self.client.create_structured_output(
-            system_prompt=build_report_clause_assessment_system_prompt(),
-            user_prompt=build_report_clause_assessment_prompt(
-                report_unit,
-                selected_chapters,
-                selected_sections,
+        def resolve_clause_assessment() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            assessment_result = self.client.create_structured_output(
+                system_prompt=build_report_clause_assessment_system_prompt(),
+                user_prompt=build_report_clause_assessment_prompt(
+                    report_unit,
+                    selected_chapters,
+                    selected_sections,
+                    selected_clauses,
+                ),
+                schema_name="report_comparison_clause_assessment",
+                schema=CLAUSE_ASSESSMENT_SCHEMA,
+            )
+            items = self._normalize_assessment_items(
+                self._extract_assessment_rows(assessment_result),
                 selected_clauses,
-            ),
-            schema_name="report_comparison_clause_assessment",
-            schema=CLAUSE_ASSESSMENT_SCHEMA,
+            )
+            if not items:
+                logger.warning("Report comparison assessment returned no normalized items for %s. Raw payload: %s", standard_id, assessment_result)
+                raise ResponseAPIError(f"Report comparison returned no clause assessments for {standard_id}.")
+            return assessment_result, items
+
+        assessment_result, items = self._run_stage_with_format_retries(
+            stage_name="clause_assessment",
+            standard_id=standard_id,
+            operation=resolve_clause_assessment,
         )
-        items = self._normalize_assessment_items(
-            self._extract_assessment_rows(assessment_result),
-            selected_clauses,
-        )
-        if not items:
-            logger.warning("Report comparison assessment returned no normalized items for %s. Raw payload: %s", standard_id, assessment_result)
-            raise ResponseAPIError(f"Report comparison returned no clause assessments for {standard_id}.")
 
         summary = str(
             assessment_result.get("summary")
             or assessment_result.get("overall_summary")
             or self._build_summary_text(items)
         ).strip()
+        summary = self._maybe_generate_violated_summary(
+            report_unit=report_unit,
+            standard_id=standard_id,
+            selected_chapters=selected_chapters,
+            selected_sections=selected_sections,
+            selected_clauses=selected_clauses,
+            items=items,
+            fallback_summary=summary,
+        )
         coverage_score = self._resolve_coverage_score(assessment_result, items)
         return {
             "chapter_ids": chapter_ids,
@@ -385,7 +475,13 @@ class ReportComparisonAgentService:
             clause_id = self._resolve_candidate_id(item, "clause_id", clause_lookup)
             if not clause_id:
                 continue
-            status = self._normalize_status(item.get("status"))
+            status = self._normalize_status(
+                item.get("status")
+                or item.get("coverage_status")
+                or item.get("coverageStatus")
+                or item.get("assessment_status")
+                or item.get("assessmentStatus")
+            )
             if status not in {"covered", "partial", "missing", "violated", "not_applicable"}:
                 continue
             evidence = (
@@ -420,7 +516,7 @@ class ReportComparisonAgentService:
             return []
 
         rows: list[dict[str, Any]] = []
-        if any(key in values for key in ("clause_id", "clauseId", "status", "reason", "analysis")):
+        if any(key in values for key in ("clause_id", "clauseId", "status", "coverage_status", "coverageStatus", "reason", "analysis")):
             rows.append(values)
         for key, value in values.items():
             if isinstance(value, list):
@@ -616,3 +712,173 @@ class ReportComparisonAgentService:
             f"missing={counts['missing']}, violated={counts['violated']}, "
             f"not_applicable={counts['not_applicable']}"
         )
+
+    def _maybe_generate_violated_summary(
+        self,
+        *,
+        report_unit: dict[str, Any],
+        standard_id: str,
+        selected_chapters: list[dict[str, Any]],
+        selected_sections: list[dict[str, Any]],
+        selected_clauses: list[dict[str, Any]],
+        items: list[dict[str, Any]],
+        fallback_summary: str,
+    ) -> str:
+        violated_items = [item for item in items if item.get("status") == "violated"]
+        if not violated_items:
+            return fallback_summary
+
+        clause_by_id = {str(item.get("id") or ""): item for item in selected_clauses if item.get("id")}
+        violated_payload = []
+        for item in violated_items:
+            clause = clause_by_id.get(str(item.get("clause_id") or ""))
+            violated_payload.append(
+                {
+                    "clause_id": item.get("clause_id"),
+                    "clause_ref": clause.get("clause_ref") if clause else None,
+                    "label": clause.get("label") if clause else None,
+                    "status": item.get("status"),
+                    "reason": item.get("reason"),
+                    "report_evidence": item.get("report_evidence"),
+                }
+            )
+
+        def resolve_violated_summary() -> dict[str, Any]:
+            payload = self.client.create_structured_output(
+                system_prompt=build_report_violated_summary_system_prompt(),
+                user_prompt=build_report_violated_summary_prompt(
+                    report_unit,
+                    selected_chapters,
+                    selected_sections,
+                    violated_payload,
+                ),
+                schema_name="report_comparison_violated_summary",
+                schema=VIOLATED_SUMMARY_SCHEMA,
+            )
+            summary = str(payload.get("summary") or "").strip()
+            if not summary:
+                raise ResponseAPIError(f"Report comparison violated summary returned no summary for {standard_id}.")
+            return payload
+
+        try:
+            payload = resolve_violated_summary()
+        except ResponseAPIError as exc:
+            fallback_text = self._try_generate_violated_summary_text(
+                report_unit=report_unit,
+                standard_id=standard_id,
+                selected_chapters=selected_chapters,
+                selected_sections=selected_sections,
+                violated_payload=violated_payload,
+                base_error=exc,
+            )
+            if fallback_text:
+                return fallback_text
+            return fallback_summary
+        return str(payload.get("summary") or fallback_summary).strip() or fallback_summary
+
+    def _try_generate_violated_summary_text(
+        self,
+        *,
+        report_unit: dict[str, Any],
+        standard_id: str,
+        selected_chapters: list[dict[str, Any]],
+        selected_sections: list[dict[str, Any]],
+        violated_payload: list[dict[str, Any]],
+        base_error: ResponseAPIError,
+    ) -> str | None:
+        if not hasattr(self.client, "create_text_output"):
+            logger.warning(
+                "Report comparison violated summary plain text fallback is unavailable for %s; keeping base summary.",
+                standard_id,
+            )
+            return None
+        logger.warning(
+            "Report comparison violated summary structured output failed for %s; retrying with plain text fallback. Error: %s",
+            standard_id,
+            base_error,
+        )
+
+        def resolve_violated_summary_text() -> str:
+            raw_text = self.client.create_text_output(
+                system_prompt=build_report_violated_summary_text_system_prompt(),
+                user_prompt=build_report_violated_summary_prompt(
+                    report_unit,
+                    selected_chapters,
+                    selected_sections,
+                    violated_payload,
+                ),
+            )
+            summary = self._normalize_generated_summary_text(raw_text)
+            if not summary:
+                raise ResponseAPIError(f"Report comparison violated text summary returned no summary for {standard_id}.")
+            return summary
+
+        try:
+            return self._run_stage_with_format_retries(
+                stage_name="violated_summary_text",
+                standard_id=standard_id,
+                operation=resolve_violated_summary_text,
+            )
+        except ResponseAPIError as exc:
+            logger.warning(
+                "Report comparison violated summary failed for %s; keeping base summary. Error: %s",
+                standard_id,
+                exc,
+            )
+            return None
+
+    def _normalize_generated_summary_text(self, raw_text: Any) -> str:
+        text = str(raw_text or "").strip()
+        if not text:
+            return ""
+        fenced_match = re.match(r"^```(?:json|text)?\s*(.*?)\s*```$", text, flags=re.DOTALL | re.IGNORECASE)
+        if fenced_match:
+            text = fenced_match.group(1).strip()
+        if text.startswith("{") and text.endswith("}"):
+            import json
+
+            try:
+                payload = json.loads(text)
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                summary = payload.get("summary")
+                if isinstance(summary, str) and summary.strip():
+                    text = summary.strip()
+        text = re.sub(r"^\s*(?:summary|摘要|总结)\s*[:：]\s*", "", text, flags=re.IGNORECASE).strip()
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+            text = text[1:-1].strip()
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _run_stage_with_format_retries(
+        self,
+        *,
+        stage_name: str,
+        standard_id: str,
+        operation: Any,
+    ) -> Any:
+        max_retries = max(0, self.config.llm.batch_max_retries)
+        max_attempts = max_retries + 1
+        last_error: ResponseAPIError | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return operation()
+            except ResponseAPIError as exc:
+                last_error = exc
+                if attempt >= max_attempts:
+                    raise
+                delay_seconds = max(0.0, self.config.llm.batch_retry_backoff_seconds) * attempt
+                logger.warning(
+                    "Retrying report comparison %s for %s after attempt %s/%s due to incompatible structured output: %s",
+                    stage_name,
+                    standard_id,
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                if delay_seconds > 0:
+                    time.sleep(delay_seconds)
+        if last_error is not None:
+            raise last_error
+        raise ResponseAPIError(f"Report comparison {stage_name} failed for {standard_id}.")

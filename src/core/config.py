@@ -110,6 +110,7 @@ class KnowledgeGraphConfig(BaseModel):
     extraction_mode: Literal["heuristic", "llm", "hybrid"] = "llm"
     fallback_to_heuristic_on_llm_error: bool = True
     include_appendix_requirements: bool = False
+    generate_chapter_summaries: bool = True
     materialize_graph: bool = True
 
 

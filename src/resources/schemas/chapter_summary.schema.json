@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "针对该规范 chapter 内容的简短中文摘要。"
+    }
+  },
+  "required": [
+    "summary"
+  ]
+}

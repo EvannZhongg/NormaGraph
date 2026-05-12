@@ -91,7 +91,7 @@ class GraphMaterializationService:
                     "standard_uid": standard_uid,
                     "node_type": structure_node["node_type"],
                     "label": structure_node.get("title") or structure_node.get("ref"),
-                    "text_content": structure_node.get("raw_text") or structure_node.get("title") or structure_node.get("ref"),
+                    "text_content": self._structure_node_text_content(structure_node),
                     "properties": structure_node,
                 }
             )
@@ -212,6 +212,15 @@ class GraphMaterializationService:
     def _edge_uid(self, edge_type: str, source_uid: str, target_uid: str) -> str:
         digest = hashlib.sha1(f"{edge_type}|{source_uid}|{target_uid}".encode("utf-8")).hexdigest()[:16]
         return f"edge:{digest}"
+
+    def _structure_node_text_content(self, structure_node: dict[str, Any]) -> str:
+        parts = [
+            str(structure_node.get("raw_text") or structure_node.get("title") or structure_node.get("ref") or "").strip()
+        ]
+        summary = str(structure_node.get("summary") or "").strip()
+        if summary:
+            parts.append(summary)
+        return "\n".join(part for part in parts if part).strip()
 
     def _dedupe_strings(self, values: list[str]) -> list[str]:
         seen: set[str] = set()

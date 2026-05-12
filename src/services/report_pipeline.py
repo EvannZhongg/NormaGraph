@@ -57,9 +57,7 @@ class ReportPipelineService:
         )
 
     def run(self, artifact_dir: Path, document_id: str) -> ReportPipelineOutput:
-        content_list_path = artifact_dir / 'content_list_v2.json'
-        if not content_list_path.exists():
-            raise FileNotFoundError(f'content_list_v2.json was not found in {artifact_dir}')
+        content_list_path = self._resolve_content_list_path(artifact_dir)
 
         data = json.loads(content_list_path.read_text(encoding='utf-8'))
         normalized_blocks = self._flatten_content_list(data)
@@ -116,6 +114,15 @@ class ReportPipelineService:
             metrics=metrics,
             report_markdown=report_markdown,
         )
+
+    def _resolve_content_list_path(self, artifact_dir: Path) -> Path:
+        content_list_path = artifact_dir / 'content_list_v2.json'
+        if content_list_path.exists():
+            return content_list_path
+        prefixed_matches = sorted(artifact_dir.glob('*_content_list_v2.json'))
+        if prefixed_matches:
+            return prefixed_matches[0]
+        raise FileNotFoundError(f'content_list_v2.json was not found in {artifact_dir}')
 
     def write_outputs(
         self,
@@ -188,21 +195,21 @@ class ReportPipelineService:
                             )
                         )
                 elif block_type == 'paragraph':
-                    text = self._join_text_fragments(item.get('content', {}).get('paragraph_content', []))
+                    text = self._join_rich_fragments(item.get('content', {}).get('paragraph_content', []))
                     if text:
                         blocks.append(self._make_block(page_idx, block_idx, None, 'paragraph', text, bbox, item))
                 elif block_type == 'list':
                     for item_idx, list_item in enumerate(item.get('content', {}).get('list_items', []), start=1):
-                        text = self._join_text_fragments(list_item.get('item_content', []))
+                        text = self._join_rich_fragments(list_item.get('item_content', []))
                         if text:
                             blocks.append(self._make_block(page_idx, block_idx, item_idx, 'list_item', text, bbox, item))
                 elif block_type == 'table':
                     table_payload = self._table_to_payload(item.get('content', {}))
                     if table_payload is None:
                         continue
-                    table_text = table_payload.get('text', '')
-                    if table_text or table_payload.get('table_html') or table_payload.get('image_path'):
-                        blocks.append(self._make_block(page_idx, block_idx, None, 'table', table_text, bbox, item, extra=table_payload))
+                    table_markup = table_payload.get('text', '')
+                    if table_markup or table_payload.get('table_html') or table_payload.get('image_path'):
+                        blocks.append(self._make_block(page_idx, block_idx, None, 'table', table_markup, bbox, item, extra=table_payload))
                 elif block_type == 'image':
                     image_payload = self._image_to_payload(item.get('content', {}))
                     if image_payload is None:
@@ -215,7 +222,11 @@ class ReportPipelineService:
         return blocks
 
     def _build_title_inventory(self, normalized_blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        title_blocks = [block for block in normalized_blocks if block['source_type'] == 'title']
+        title_blocks = [
+            block
+            for block in normalized_blocks
+            if block['source_type'] == 'title' and block.get('raw_title_level') is not None
+        ]
         next_title_by_block_id: dict[str, str | None] = {}
         following_title_text: str | None = None
         for block in reversed(title_blocks):
@@ -253,10 +264,11 @@ class ReportPipelineService:
         title_inventory: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[str], dict[str, Any]]:
         heuristic_plan = self._build_heuristic_title_plan(title_inventory)
-        plan_by_block_id = {item['title_id']: item for item in heuristic_plan}
+        heuristic_by_block_id = {item['title_id']: item for item in heuristic_plan}
+        plan_by_block_id: dict[str, dict[str, Any]] = {}
         warnings: list[str] = []
         metrics: dict[str, Any] = {
-            'title_plan_source': 'heuristic',
+            'title_plan_source': 'llm_only' if getattr(self.outline_planner, 'enabled', False) else 'none',
             'title_planner_enabled': bool(getattr(self.outline_planner, 'enabled', False)),
             'title_plan_llm_item_count': 0,
         }
@@ -273,21 +285,15 @@ class ReportPipelineService:
                 llm_item_count = 0
                 for item in planner_result.items:
                     title_id = item.get('title_id')
-                    if not title_id or title_id not in plan_by_block_id:
+                    if not title_id or title_id not in heuristic_by_block_id:
                         continue
-                    base_item = plan_by_block_id[title_id]
+                    base_item = heuristic_by_block_id[title_id]
                     merged_item = {**base_item, **item}
-                    for key in ('ref', 'confidence', 'rationale'):
-                        if item.get(key) is None:
-                            merged_item[key] = base_item.get(key)
                     merged_item['planner_source'] = item.get('planner_source') or 'llm'
                     plan_by_block_id[title_id] = merged_item
                     llm_item_count += 1
                 metrics['title_plan_llm_item_count'] = llm_item_count
-                if llm_item_count >= len(title_inventory) and title_inventory:
-                    metrics['title_plan_source'] = 'llm'
-                elif llm_item_count > 0:
-                    metrics['title_plan_source'] = 'hybrid'
+                metrics['title_plan_source'] = 'llm' if llm_item_count else 'none'
 
         plan = [plan_by_block_id[item['title_id']] for item in title_inventory if item['title_id'] in plan_by_block_id]
         return plan, plan_by_block_id, warnings, metrics
@@ -405,17 +411,24 @@ class ReportPipelineService:
                 order_index=next_order(),
             )
 
-        def register_member(member_uid: str, text: str | None, block: dict[str, Any]) -> None:
+        def register_member(
+            member_uid: str,
+            text: str | None,
+            block: dict[str, Any],
+            *,
+            page_span: list[int] | None = None,
+        ) -> None:
             if not section_stack:
                 active_section()
+            span = page_span or [block['page_idx'], block['page_idx']]
             for section in section_stack:
                 section['member_uids'].append(member_uid)
                 section['content_block_count'] += 1
                 if not section.get('content_page_span'):
-                    section['content_page_span'] = [block['page_idx'], block['page_idx']]
+                    section['content_page_span'] = [span[0], span[1]]
                 else:
-                    section['content_page_span'][0] = min(section['content_page_span'][0], block['page_idx'])
-                    section['content_page_span'][1] = max(section['content_page_span'][1], block['page_idx'])
+                    section['content_page_span'][0] = min(section['content_page_span'][0], span[0])
+                    section['content_page_span'][1] = max(section['content_page_span'][1], span[1])
                 if not section.get('last_content_block_id'):
                     section['first_content_block_id'] = block['block_id']
                 section['last_content_block_id'] = block['block_id']
@@ -439,11 +452,16 @@ class ReportPipelineService:
             structural_path = [section['title'] for section in section_stack if section.get('is_structural')]
             local_heading_path = [section['title'] for section in section_stack if section.get('hierarchy_level', 0) >= 4]
             page_values = [block['page_idx'] for block in text_buffer]
+            first_block = text_buffer[0]
+            single_block_type = first_block['source_type'] if len(text_buffer) == 1 else 'text'
+            unit_type = single_block_type if single_block_type in {'table', 'image'} else 'text'
             unit = {
                 'unit_uid': unit_uid,
                 'document_id': document_id,
                 'parent_section_uid': parent['section_uid'],
-                'unit_type': 'text' if len(text_buffer) > 1 or text_buffer[0]['source_type'] in TEXTUAL_BLOCK_TYPES else text_buffer[0]['source_type'],
+                'unit_type': unit_type,
+                'title': first_block.get('table_caption') or first_block.get('figure_caption'),
+                'html': first_block.get('table_html') if unit_type == 'table' else None,
                 'section_path': section_path,
                 'structural_path': structural_path,
                 'local_heading_path': local_heading_path,
@@ -456,20 +474,20 @@ class ReportPipelineService:
                 'page_role': text_buffer[0].get('page_role'),
             }
             report_units.append(unit)
-            register_member(unit_uid, normalized_text, text_buffer[-1])
+            register_member(unit_uid, normalized_text, text_buffer[-1], page_span=unit['source_page_span'])
             text_buffer.clear()
 
         for block in normalized_blocks:
             source_type = block['source_type']
 
             if source_type == 'title':
-                flush_text_unit()
                 spec = title_plan_by_block_id.get(block['block_id'])
-                if spec is None:
-                    continue
-                if spec['section_kind'] == 'ignore':
+                if spec is None or spec['section_kind'] == 'ignore':
+                    flush_text_unit()
+                    text_buffer.append(block)
                     continue
 
+                flush_text_unit()
                 self._open_section(
                     sections=sections,
                     section_map=section_map,
@@ -483,23 +501,15 @@ class ReportPipelineService:
                 )
                 continue
 
-            if block.get('page_role') == 'toc':
-                continue
-
             if source_type in TEXTUAL_BLOCK_TYPES:
                 text_buffer.append(block)
-                if sum(len(item['text_normalized']) for item in text_buffer) >= 900 or len(text_buffer) >= 4:
-                    flush_text_unit()
                 continue
 
             if source_type == 'list_item':
-                flush_text_unit()
                 text_buffer.append(block)
-                flush_text_unit()
                 continue
 
             if source_type == 'table':
-                flush_text_unit()
                 parent = active_section()
                 section_path = [section['title'] for section in section_stack]
                 structural_path = [section['title'] for section in section_stack if section.get('is_structural')]
@@ -514,7 +524,6 @@ class ReportPipelineService:
                     'table_caption': block.get('table_caption'),
                     'table_title': block.get('table_title') or block.get('table_caption'),
                     'table_html': block.get('table_html'),
-                    'table_text': block.get('text_normalized') or block.get('text'),
                     'image_path': block.get('image_path'),
                     'source_block_id': block['block_id'],
                     'source_page_idx': block['page_idx'],
@@ -523,11 +532,10 @@ class ReportPipelineService:
                     'page_role': block.get('page_role'),
                 }
                 tables.append(table)
-                register_member(table_uid, table.get('table_text') or table.get('table_caption'), block)
+                text_buffer.append(block)
                 continue
 
             if source_type == 'image':
-                flush_text_unit()
                 figure_text = block.get('text_normalized') or block.get('text')
                 if not figure_text and not block.get('image_path'):
                     continue
@@ -553,7 +561,7 @@ class ReportPipelineService:
                     'page_role': block.get('page_role'),
                 }
                 figures.append(figure)
-                register_member(figure_uid, figure_text, block)
+                text_buffer.append(block)
 
         flush_text_unit()
 
@@ -667,7 +675,7 @@ class ReportPipelineService:
             children_by_parent[parent_uid].append((unit['order_index'], unit['unit_uid']))
 
         for table in tables:
-            text_content = '\n'.join(part for part in [table.get('table_caption'), table.get('table_text')] if part).strip()
+            text_content = str(table.get('table_html') or '').strip()
             add_node(
                 {
                     'node_uid': table['table_uid'],
@@ -791,7 +799,7 @@ class ReportPipelineService:
         enumerated_match = ENUMERATED_TITLE_RE.match(normalized)
         if enumerated_match:
             return {
-                'section_kind': 'subtopic',
+                'section_kind': 'ignore',
                 'hierarchy_level': 5,
                 'ref': enumerated_match.group('marker'),
                 'is_structural': False,
@@ -800,7 +808,7 @@ class ReportPipelineService:
         chinese_enumerated_match = CHINESE_ENUMERATED_TITLE_RE.match(normalized)
         if chinese_enumerated_match:
             return {
-                'section_kind': 'topic',
+                'section_kind': 'ignore',
                 'hierarchy_level': 4,
                 'ref': chinese_enumerated_match.group('marker'),
                 'is_structural': False,
@@ -989,16 +997,6 @@ class ReportPipelineService:
         image_path = ((content.get('image_source') or {}).get('path') or '').strip() or None
         if image_path and image_path.endswith('/'):
             image_path = None
-        table_text = '\n'.join(
-            part
-            for part in [
-                caption,
-                self._table_html_to_text(html) if html else '',
-                text_body,
-                footnote,
-            ]
-            if part
-        ).strip()
         if not any([caption, html, text_body, footnote, image_path]):
             return None
         ref_match = TABLE_REF_RE.search(caption or text_body or '')
@@ -1009,7 +1007,7 @@ class ReportPipelineService:
             'table_html': html,
             'table_footnote': footnote or None,
             'image_path': image_path,
-            'text': table_text,
+            'text': html or '',
         }
 
     def _image_to_payload(self, content: dict[str, Any]) -> dict[str, Any] | None:
@@ -1036,6 +1034,13 @@ class ReportPipelineService:
 
     def _join_rich_fragments(self, fragments: Any, *, separator: str = '') -> str:
         if isinstance(fragments, dict):
+            fragment_type = str(fragments.get('type') or '').strip().lower()
+            if fragment_type == 'equation_inline':
+                return self._wrap_inline_math(fragments.get('content'))
+            if fragment_type in {'equation_interline', 'equation'}:
+                return self._wrap_display_math(fragments.get('math_content') or fragments.get('content'))
+            if fragments.get('math_content'):
+                return self._wrap_display_math(fragments.get('math_content'))
             return self._join_rich_fragments(fragments.get('content'), separator=separator)
         if isinstance(fragments, list):
             parts = [self._join_rich_fragments(item, separator='') for item in fragments]
@@ -1047,6 +1052,18 @@ class ReportPipelineService:
             return fragments.strip()
         return str(fragments).strip()
 
+    def _wrap_inline_math(self, value: Any) -> str:
+        text = str(value or '').strip()
+        if not text:
+            return ''
+        return f'\\({text}\\)'
+
+    def _wrap_display_math(self, value: Any) -> str:
+        text = str(value or '').strip()
+        if not text:
+            return ''
+        return f'\\[{text}\\]'
+
     def _normalize_text(self, text: str | None) -> str:
         value = unescape(str(text or '')).replace('\u3000', ' ').replace('\xa0', ' ')
         value = value.replace('\r\n', '\n').replace('\r', '\n')
@@ -1054,21 +1071,6 @@ class ReportPipelineService:
         for line in value.split('\n'):
             stripped = CHINESE_SPACED_RE.sub('', line)
             stripped = MULTI_SPACE_RE.sub(' ', stripped).strip()
-            if stripped:
-                lines.append(stripped)
-        return '\n'.join(lines)
-
-    def _table_html_to_text(self, html: str | None) -> str:
-        if not html:
-            return ''
-        value = unescape(html)
-        value = re.sub(r'(?i)</(?:td|th)>', ' | ', value)
-        value = re.sub(r'(?i)</tr>', '\n', value)
-        value = re.sub(r'(?i)<br\s*/?>', '\n', value)
-        value = re.sub(r'(?is)<[^>]+>', ' ', value)
-        lines = []
-        for line in value.split('\n'):
-            stripped = MULTI_SPACE_RE.sub(' ', line).strip(' |')
             if stripped:
                 lines.append(stripped)
         return '\n'.join(lines)
