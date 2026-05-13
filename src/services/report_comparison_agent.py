@@ -218,6 +218,9 @@ def build_report_violated_summary_prompt(
 
 
 def _report_scope_payload(report_unit: dict[str, Any]) -> dict[str, Any]:
+    if report_unit.get("scope_uid"):
+        return _report_section_scope_payload(report_unit)
+
     report_text = (
         report_unit.get("html")
         if report_unit.get("unit_type") == "table" or report_unit.get("unitType") == "table"
@@ -235,6 +238,22 @@ def _report_scope_payload(report_unit: dict[str, Any]) -> dict[str, Any]:
     if unit_titles:
         payload["unit_titles"] = unit_titles
     return payload
+
+
+def _report_section_scope_payload(report_scope: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "section_title": report_scope.get("title"),
+        "section_path": report_scope.get("section_path") or report_scope.get("sectionPath") or [],
+        "unit_titles": report_scope.get("unit_titles") or report_scope.get("unitTitles") or [],
+        "section_text": (
+            report_scope.get("text_summary")
+            or report_scope.get("summary")
+            or report_scope.get("text_normalized")
+            or report_scope.get("textNormalized")
+            or report_scope.get("text")
+            or ""
+        ),
+    }
 
 
 def _json_payload(payload: dict[str, Any]) -> str:
