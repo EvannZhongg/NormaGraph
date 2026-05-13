@@ -50,6 +50,8 @@ GRAPH_WORKBENCH_DEFAULT_DEPTH = 2
 GRAPH_WORKBENCH_MAX_DEPTH = 4
 GRAPH_WORKBENCH_DEFAULT_NODES = 220
 GRAPH_WORKBENCH_MAX_NODES = 3000
+REPORT_ROUTING_SCOPE_TEXT_MAX_CHARS = 4000
+REPORT_ROUTING_UNIT_TITLE_MAX_CHARS = 120
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +139,7 @@ class IngestionService:
                     "title": item.get("title") or "",
                     "sectionKind": item.get("section_kind") or "",
                     "path": item.get("path") or [],
+                    "textSummary": item.get("summary") or item.get("text_summary") or "",
                     "orderIndex": int(item.get("order_index") or 0),
                     "pageSpan": item.get("page_span") or [],
                     "memberCount": int(item.get("member_count") or 0),
@@ -1401,13 +1404,13 @@ class IngestionService:
     ) -> dict[str, Any]:
         ordered_units = sorted(units, key=lambda item: (int(item.get("orderIndex") or 0), str(item.get("unitUid") or "")))
         text_parts = [
-            str(
-                item.get("html")
-                if item.get("unitType") == "table"
-                else (item.get("textNormalized") or item.get("text") or "")
-            ).strip()
+            self._report_scope_unit_text(item)
             for item in ordered_units
         ]
+        section_text = "\n\n".join(part for part in text_parts if part)
+        section_summary = self._report_section_summary_text(section)
+        routing_text = section_summary or section_text
+        routing_text = self._truncate_report_scope_text(routing_text, max_chars=REPORT_ROUTING_SCOPE_TEXT_MAX_CHARS)
         page_values = [int(page) for item in ordered_units for page in (item.get("pageSpan") or []) if isinstance(page, int)]
         section_path = list(section.get("path") or []) if section else list(ordered_units[0].get("sectionPath") or [])
         title = (
@@ -1420,12 +1423,57 @@ class IngestionService:
             "title": title,
             "section_path": section_path,
             "structural_path": list(ordered_units[0].get("structuralPath") or []),
-            "text": "\n\n".join(part for part in text_parts if part),
-            "text_normalized": "\n\n".join(part for part in text_parts if part),
+            "unit_titles": self._report_scope_unit_titles(ordered_units),
+            "text": routing_text,
+            "text_normalized": routing_text,
             "page_span": [min(page_values), max(page_values)] if page_values else [],
             "order_index": int(section.get("orderIndex") or 0) if section else int(ordered_units[0].get("orderIndex") or 0),
             "unit_ids": [str(item.get("unitUid") or "") for item in ordered_units],
         }
+
+    def _report_scope_unit_text(self, report_unit: dict[str, Any]) -> str:
+        if report_unit.get("unitType") == "table" or report_unit.get("unit_type") == "table":
+            return str(
+                report_unit.get("html")
+                or report_unit.get("textNormalized")
+                or report_unit.get("text_normalized")
+                or report_unit.get("text")
+                or ""
+            ).strip()
+        return str(
+            report_unit.get("textNormalized")
+            or report_unit.get("text_normalized")
+            or report_unit.get("text")
+            or ""
+        ).strip()
+
+    def _report_section_summary_text(self, section: dict[str, Any] | None) -> str:
+        if not section:
+            return ""
+        return str(
+            section.get("summary")
+            or section.get("textSummary")
+            or section.get("text_summary")
+            or ""
+        ).strip()
+
+    def _report_scope_unit_titles(self, ordered_units: list[dict[str, Any]]) -> list[str]:
+        titles: list[str] = []
+        for item in ordered_units:
+            title = str(item.get("title") or "").strip()
+            if not title:
+                continue
+            titles.append(self._truncate_report_scope_text(title, max_chars=REPORT_ROUTING_UNIT_TITLE_MAX_CHARS))
+        return titles
+
+    def _truncate_report_scope_text(self, text: str | None, *, max_chars: int) -> str:
+        normalized = re.sub(r"\n{3,}", "\n\n", str(text or "").strip())
+        if len(normalized) <= max_chars:
+            return normalized
+        marker = "...<truncated>"
+        if max_chars <= len(marker):
+            return normalized[:max_chars].rstrip()
+        return normalized[: max_chars - len(marker)].rstrip() + marker
 
     def _materialize_report_unit_result(
         self,

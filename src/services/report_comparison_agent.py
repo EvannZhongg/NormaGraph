@@ -223,7 +223,7 @@ def _report_scope_payload(report_unit: dict[str, Any]) -> dict[str, Any]:
         if report_unit.get("unit_type") == "table" or report_unit.get("unitType") == "table"
         else (report_unit.get("text_normalized") or report_unit.get("textNormalized") or report_unit.get("text"))
     )
-    return {
+    payload = {
         "unit_uid": report_unit.get("unit_uid") or report_unit.get("unitUid") or report_unit.get("scope_uid"),
         "title": report_unit.get("title"),
         "section_path": report_unit.get("section_path") or report_unit.get("sectionPath") or [],
@@ -231,6 +231,10 @@ def _report_scope_payload(report_unit: dict[str, Any]) -> dict[str, Any]:
         "text": report_text,
         "page_span": report_unit.get("source_page_span") or report_unit.get("page_span") or report_unit.get("pageSpan"),
     }
+    unit_titles = report_unit.get("unit_titles") or report_unit.get("unitTitles")
+    if unit_titles:
+        payload["unit_titles"] = unit_titles
+    return payload
 
 
 def _json_payload(payload: dict[str, Any]) -> str:
