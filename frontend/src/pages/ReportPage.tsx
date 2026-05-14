@@ -63,6 +63,7 @@ export function ReportPage() {
   const [selectedReportId, setSelectedReportId] = useState<string | null>(null)
   const [selectedKgSpaceId, setSelectedKgSpaceId] = useState<string | null>(null)
   const [reportDetail, setReportDetail] = useState<ReportSpaceDetail | null>(null)
+  const [lastLoadedReportDetail, setLastLoadedReportDetail] = useState<ReportSpaceDetail | null>(null)
   const [selectedUnitId, setSelectedUnitId] = useState<string | null>(null)
   const [loadingComparison, setLoadingComparison] = useState(false)
   const [loadingFullKgGraph, setLoadingFullKgGraph] = useState(false)
@@ -74,7 +75,8 @@ export function ReportPage() {
   const [comparisonGraphStatusView, setComparisonGraphStatusView] = useState<ComparisonGraphStatusView>('all')
   const [comparisonGraphFrequencyRange, setComparisonGraphFrequencyRange] = useState<ComparisonGraphFrequencyRangeId>('all')
 
-  const graphContainerRef = useRef<HTMLDivElement | null>(null)
+  const unitGraphContainerRef = useRef<HTMLDivElement | null>(null)
+  const comparisonGraphContainerRef = useRef<HTMLDivElement | null>(null)
   const sigmaContainerRef = useRef<HTMLDivElement | null>(null)
   const sigmaRef = useRef<Sigma | null>(null)
   const runtimeGraphRef = useRef<RuntimeGraph | null>(null)
@@ -88,16 +90,25 @@ export function ReportPage() {
     () => kgSpaces.find((item) => item.standardId === selectedKgSpaceId) ?? null,
     [kgSpaces, selectedKgSpaceId],
   )
+  const effectiveReportDetail = useMemo(() => {
+    if (reportDetail?.reportUnits.length) {
+      return reportDetail
+    }
+    if (lastLoadedReportDetail?.documentId === selectedReportId && lastLoadedReportDetail.reportUnits.length) {
+      return lastLoadedReportDetail
+    }
+    return reportDetail
+  }, [lastLoadedReportDetail, reportDetail, selectedReportId])
   const sectionsById = useMemo(() => {
     const next = new Map<string, ReportSectionSummary>()
-    reportDetail?.sections.forEach((item) => next.set(item.sectionUid, item))
+    effectiveReportDetail?.sections.forEach((item) => next.set(item.sectionUid, item))
     return next
-  }, [reportDetail])
+  }, [effectiveReportDetail])
 
   const orderedUnits = useMemo(
-    () => [...(reportDetail?.reportUnits ?? [])]
+    () => [...(effectiveReportDetail?.reportUnits ?? [])]
       .sort((left, right) => left.orderIndex - right.orderIndex),
-    [reportDetail],
+    [effectiveReportDetail],
   )
 
   const activeJobs = useMemo(
@@ -176,7 +187,7 @@ export function ReportPage() {
   )
   const comparisonGraphMeta = useMemo(() => summarizeComparisonGraph(filteredComparisonGraphData), [filteredComparisonGraphData])
   const activeGraphData = useMemo(
-    () => (contentView === 'comparison-graph' ? filteredComparisonGraphData : selectedUnitComparison?.graph ?? null),
+    () => (contentView === 'comparison-graph' ? filteredComparisonGraphData : hideReportUnitNodes(selectedUnitComparison?.graph ?? null)),
     [contentView, filteredComparisonGraphData, selectedUnitComparison?.graph],
   )
   const selectedGraphNode = useMemo(() => {
@@ -191,11 +202,13 @@ export function ReportPage() {
   useEffect(() => {
     if (!selectedReportId) {
       setReportDetail(null)
+      setLastLoadedReportDetail(null)
       setJobs([])
       setSelectedUnitId(null)
       setComparisonDetail(null)
       return
     }
+    setLastLoadedReportDetail(null)
     setComparisonDetail(null)
     setSelectedUnitId(null)
     void loadReportWorkspace(selectedReportId)
@@ -274,7 +287,9 @@ export function ReportPage() {
 
   useEffect(() => {
     const graphData = activeGraphData
-    const container = graphContainerRef.current
+    const container = contentView === 'comparison-graph'
+      ? comparisonGraphContainerRef.current
+      : unitGraphContainerRef.current
     if (!container) {
       return
     }
@@ -370,6 +385,7 @@ export function ReportPage() {
       }
       if (latestJob.status === 'failed') {
         setReportDetail(null)
+        setLastLoadedReportDetail(null)
         setSelectedUnitId(null)
         if (showSpinner) {
           toast.error(latestJob.error || '报告处理失败')
@@ -380,10 +396,14 @@ export function ReportPage() {
       try {
         const detail = await getReportSpace(documentId)
         setReportDetail(detail)
+        if (detail.reportUnits.length) {
+          setLastLoadedReportDetail(detail)
+        }
         setSelectedUnitId((current) => current ?? detail.reportUnits[0]?.unitUid ?? null)
       } catch (error) {
         if (isNotFoundError(error)) {
           setReportDetail(null)
+          setLastLoadedReportDetail(null)
           setSelectedUnitId(null)
           return
         }
@@ -704,8 +724,8 @@ export function ReportPage() {
             </div>
           </div>
           {contentView === 'comparison-graph' ? (
-            <div className="relative min-h-0 overflow-hidden">
-              <div ref={graphContainerRef} className="h-full w-full" />
+            <div key="comparison-graph-pane" className="relative min-h-0 overflow-hidden">
+              <div ref={comparisonGraphContainerRef} className="h-full w-full" />
               <div className="absolute left-4 top-4 z-10 grid max-w-[360px] gap-3">
                 <div className="subtle-surface grid gap-2 px-4 py-3 text-xs shadow-sm">
                   <div className="flex items-center justify-between gap-4">
@@ -831,7 +851,7 @@ export function ReportPage() {
               ) : null}
             </div>
           ) : (
-          <div className="min-h-0 overflow-auto px-5 py-5">
+          <div key="report-blocks-pane" className="min-h-0 overflow-auto px-5 py-5">
             <div className="grid gap-4">
               {orderedUnits.map((unit, index) => {
                 const section = unit.parentSectionUid ? sectionsById.get(unit.parentSectionUid) : null
@@ -891,7 +911,7 @@ export function ReportPage() {
       <section className="panel-surface min-h-0 overflow-hidden">
         <div className="grid h-full min-h-0 grid-rows-[1fr,auto]">
             <div className="relative min-h-[320px]">
-              <div ref={graphContainerRef} className="h-full w-full" />
+              <div ref={unitGraphContainerRef} className="h-full w-full" />
             {!selectedUnitComparison?.graph.nodes.length ? (
               <div className="absolute inset-0 grid place-items-center text-sm text-[var(--text-secondary)]">
                 Select a report unit to view saved result.
@@ -1099,7 +1119,9 @@ function filterComparisonGraph(
     })
   }
 
-  const visibleNodeIds = includeGraphContextNodes(graph, matchedClauseIds)
+  const visibleNodeIds = includeGraphContextNodes(graph, matchedClauseIds, {
+    sectionOnlyContext: statusView !== 'all',
+  })
   const edges = graph.edges.filter((edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target))
   return {
     ...graph,
@@ -1109,12 +1131,31 @@ function filterComparisonGraph(
   }
 }
 
-function includeGraphContextNodes(graph: GraphWorkbenchData, matchedClauseIds: Set<string>) {
+function includeGraphContextNodes(
+  graph: GraphWorkbenchData,
+  matchedClauseIds: Set<string>,
+  options?: { sectionOnlyContext?: boolean },
+) {
   const visibleNodeIds = new Set<string>()
-  if (graph.rootNodeId) {
+  if (graph.rootNodeId && !options?.sectionOnlyContext) {
     visibleNodeIds.add(graph.rootNodeId)
   }
   matchedClauseIds.forEach((nodeId) => visibleNodeIds.add(nodeId))
+
+  if (options?.sectionOnlyContext) {
+    const nodeById = new Map(graph.nodes.map((node) => [node.id, node]))
+    graph.edges.forEach((edge) => {
+      const source = nodeById.get(edge.source)
+      const target = nodeById.get(edge.target)
+      if (matchedClauseIds.has(edge.target) && source?.nodeType === 'section') {
+        visibleNodeIds.add(edge.source)
+      }
+      if (matchedClauseIds.has(edge.source) && target?.nodeType === 'section') {
+        visibleNodeIds.add(edge.target)
+      }
+    })
+    return visibleNodeIds
+  }
 
   let changed = true
   while (changed) {
@@ -1126,11 +1167,37 @@ function includeGraphContextNodes(graph: GraphWorkbenchData, matchedClauseIds: S
       if (visibleNodeIds.has(edge.source)) {
         return
       }
+      const sourceNode = graph.nodes.find((node) => node.id === edge.source)
+      if (sourceNode?.nodeType === 'clause' && !matchedClauseIds.has(edge.source)) {
+        return
+      }
       visibleNodeIds.add(edge.source)
       changed = true
     })
   }
   return visibleNodeIds
+}
+
+function hideReportUnitNodes(graph: GraphWorkbenchData | null): GraphWorkbenchData | null {
+  if (!graph) {
+    return graph
+  }
+  const visibleNodeIds = new Set(
+    graph.nodes
+      .filter((node) => node.nodeType !== 'report_unit')
+      .map((node) => node.id),
+  )
+  const nodes = graph.nodes.filter((node) => visibleNodeIds.has(node.id))
+  const edges = graph.edges.filter((edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target))
+  return {
+    ...graph,
+    rootNodeId: graph.rootNodeId && visibleNodeIds.has(graph.rootNodeId)
+      ? graph.rootNodeId
+      : nodes[0]?.id ?? null,
+    nodes,
+    edges,
+    maxNodes: nodes.length,
+  }
 }
 
 function summarizeComparisonGraphFrequencyRanges(graph: GraphWorkbenchData | null, statusView: ComparisonGraphStatusView) {

@@ -65,14 +65,14 @@
   - API 数据模型
 - `src/resources/schemas/`
   - 运行时 JSON Schema 资源
-- `viewer/`
-  - 独立静态图谱前端
+- `frontend/`
+  - React + Vite 前端源码
+- `webui/`
+  - 前端构建产物，由 FastAPI 挂载到 `/webui`
 - `scripts/test_ingestion_pipeline.py`
   - 从源文件开始的前台调试脚本
 - `scripts/run_standard_pipeline.py`
   - 针对已有 artifact 的离线建图脚本
-- `scripts/serve_graph_viewer.py`
-  - 独立静态 viewer 启动脚本
 
 ## 3. 当前主链路
 
@@ -103,7 +103,7 @@ flowchart LR
 - 结构树恢复不依赖 Markdown `#` 层级，而是优先依赖编号语义与 `content_list_v2.json` 块结构。
 - requirement extraction 支持三种模式：`heuristic`、`llm`、`hybrid`。
 - 当前推荐运行策略是 `llm + fallback_to_heuristic_on_llm_error=true`。
-- 图谱既可以通过 API 读取，也可以直接由静态 viewer 从标准 graph space JSON 文件读取。
+- 图谱由 Web UI 通过同域 API 读取，生产环境不再保留独立静态前端。
 
 ## 3.1 当前存储布局
 
@@ -276,18 +276,18 @@ flowchart LR
 
 这些接口当前会显式返回 `501 Not Implemented`。
 
-## 9. 当前 viewer 形态
+## 9. 当前 Web UI 形态
 
-当前仓库已经补上一个与后端解耦的静态图谱前端：
+当前仓库已经切换到统一的前后端分离开发、单服务部署形态：
 
-- 默认直接消费标准 graph space 中的 JSON 文件
-- 不依赖 FastAPI API
-- 支持通过 `scripts/serve_graph_viewer.py` 直接预加载某个 graph space；传入 artifact 目录时会尝试通过 registry 解析到对应 space
-- 支持在页面中直接选择 `data/kg_spaces/<standard_id>` 自动加载
-- 支持节点详情、结构化属性、关联 requirement、相邻节点展示
-- 图谱区域当前采用局部邻域渲染，避免一次性加载全图造成浏览器压力
+- 前端源码位于 `frontend/`，使用 React + Vite + Tailwind CSS
+- 前端构建产物输出到 `webui/`
+- FastAPI 在运行时同时提供 API 与 `/webui` 静态资源
+- 根路径 `/` 自动重定向到 `/webui/`
+- 前端所有接口都通过同域相对路径访问
+- Knowledge Graph 页面通过 API 加载 kg space、搜索节点、请求子图并支持节点/关系编辑
 
-这意味着当前项目已经具备“生成图谱 + 独立展示图谱”的完整演示链路。
+这意味着当前项目已经具备“生成图谱 + 单服务展示图谱”的完整演示链路。
 
 ## 10. 配置体系现状
 
@@ -346,12 +346,12 @@ flowchart LR
 - `scripts/run_standard_pipeline.py`
   - 从 parse artifact 重建 graph space
 
-### 11.4 图谱展示模式
+### 11.4 Web UI 展示模式
 
-适合验收图谱结构和节点详情：
+适合验收图谱结构、文档状态和节点详情：
 
-- `scripts/serve_graph_viewer.py`
-- `viewer/index.html`
+- 先构建 `frontend/` 到 `webui/`
+- 再使用 `normagraph-server` 启动单服务入口
 
 ## 12. 当前最重要的已知风险
 
@@ -402,3 +402,4 @@ flowchart LR
 - 前台日志调试
 
 也就是说，规范知识图谱的底座已经初步搭好。下一阶段工作的重点不再是从零设计，而是把 LLM 抽取稳定性、报告对比和 QA 真正补齐。
+

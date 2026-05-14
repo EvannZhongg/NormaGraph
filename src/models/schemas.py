@@ -100,6 +100,7 @@ class ReportSectionSummary(BaseModel):
     title: str
     sectionKind: str
     path: list[str] = Field(default_factory=list)
+    textSummary: str = ""
     orderIndex: int = 0
     pageSpan: list[int] = Field(default_factory=list)
     memberCount: int = 0

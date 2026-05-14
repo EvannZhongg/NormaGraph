@@ -50,7 +50,6 @@ GRAPH_WORKBENCH_DEFAULT_DEPTH = 2
 GRAPH_WORKBENCH_MAX_DEPTH = 4
 GRAPH_WORKBENCH_DEFAULT_NODES = 220
 GRAPH_WORKBENCH_MAX_NODES = 3000
-REPORT_ROUTING_SCOPE_TEXT_MAX_CHARS = 4000
 REPORT_ROUTING_UNIT_TITLE_MAX_CHARS = 120
 
 logger = logging.getLogger(__name__)
@@ -266,6 +265,7 @@ class IngestionService:
             raise FileNotFoundError(f"Report comparison {document_id} / {standard_id} was not found.")
 
         try:
+            self._ensure_report_section_summaries(document_id)
             report_detail = self.get_report_space_detail(document_id)
             evaluation_units = self._list_evaluation_report_units(report_detail)
             if not evaluation_units:
@@ -407,6 +407,40 @@ class IngestionService:
             detail["updatedAt"] = datetime.now(UTC)
             self._save_report_comparison(document_id, standard_id, detail)
             raise
+
+    def _ensure_report_section_summaries(self, document_id: str) -> None:
+        report_space_dir = self.config.report_space_dir_for(document_id)
+        sections_path = report_space_dir / "sections.json"
+        units_path = report_space_dir / "report_units.json"
+        metrics_path = report_space_dir / "segmentation_metrics.json"
+        if not sections_path.exists() or not units_path.exists():
+            return
+
+        sections = json.loads(sections_path.read_text(encoding="utf-8"))
+        report_units = json.loads(units_path.read_text(encoding="utf-8"))
+        needs_summary = any(
+            section.get("section_uid")
+            and section.get("section_kind") not in {"toc"}
+            and section.get("member_uids")
+            and not str(section.get("summary") or "").strip()
+            for section in sections
+        )
+        if not needs_summary:
+            return
+
+        summary_metrics, summary_warnings = self.report_pipeline_service._generate_report_section_summaries(
+            document_id=document_id,
+            sections=sections,
+            report_units=report_units,
+        )
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.exists() else {}
+        metrics.update(summary_metrics)
+        metrics["report_section_summary_warning_count"] = len(summary_warnings)
+        if summary_warnings:
+            metrics["report_section_summary_warnings"] = summary_warnings
+
+        sections_path.write_text(json.dumps(sections, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def _route_report_scope_task(
         self,
@@ -1403,14 +1437,7 @@ class IngestionService:
         units: list[dict[str, Any]],
     ) -> dict[str, Any]:
         ordered_units = sorted(units, key=lambda item: (int(item.get("orderIndex") or 0), str(item.get("unitUid") or "")))
-        text_parts = [
-            self._report_scope_unit_text(item)
-            for item in ordered_units
-        ]
-        section_text = "\n\n".join(part for part in text_parts if part)
-        section_summary = self._report_section_summary_text(section)
-        routing_text = section_summary or section_text
-        routing_text = self._truncate_report_scope_text(routing_text, max_chars=REPORT_ROUTING_SCOPE_TEXT_MAX_CHARS)
+        routing_text = self._report_section_summary_text(section)
         page_values = [int(page) for item in ordered_units for page in (item.get("pageSpan") or []) if isinstance(page, int)]
         section_path = list(section.get("path") or []) if section else list(ordered_units[0].get("sectionPath") or [])
         title = (
@@ -1424,28 +1451,10 @@ class IngestionService:
             "section_path": section_path,
             "unit_titles": self._report_scope_unit_titles(ordered_units),
             "text_summary": routing_text,
-            "text": routing_text,
-            "text_normalized": routing_text,
             "page_span": [min(page_values), max(page_values)] if page_values else [],
             "order_index": int(section.get("orderIndex") or 0) if section else int(ordered_units[0].get("orderIndex") or 0),
             "unit_ids": [str(item.get("unitUid") or "") for item in ordered_units],
         }
-
-    def _report_scope_unit_text(self, report_unit: dict[str, Any]) -> str:
-        if report_unit.get("unitType") == "table" or report_unit.get("unit_type") == "table":
-            return str(
-                report_unit.get("html")
-                or report_unit.get("textNormalized")
-                or report_unit.get("text_normalized")
-                or report_unit.get("text")
-                or ""
-            ).strip()
-        return str(
-            report_unit.get("textNormalized")
-            or report_unit.get("text_normalized")
-            or report_unit.get("text")
-            or ""
-        ).strip()
 
     def _report_section_summary_text(self, section: dict[str, Any] | None) -> str:
         if not section:
@@ -2135,6 +2144,7 @@ class IngestionService:
             job.status = "succeeded"
             self._touch(job)
         except Exception as exc:
+            logger.exception("Ingestion job %s failed while processing document %s.", job.jobId, job.documentId)
             if detected_standard:
                 self._upsert_standard_detail(
                     source_path,

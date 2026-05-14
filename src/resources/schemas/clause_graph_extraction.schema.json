@@ -119,11 +119,6 @@
                       "citation_type"
                     ]
                   }
-                },
-                "confidence": {
-                  "type": "number",
-                  "minimum": 0,
-                  "maximum": 1
                 }
               },
               "required": [
@@ -134,8 +129,7 @@
                 "judgement_criteria",
                 "evidence_expected",
                 "domain_tags",
-                "cited_targets",
-                "confidence"
+                "cited_targets"
               ]
             }
           }

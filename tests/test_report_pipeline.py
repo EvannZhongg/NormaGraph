@@ -288,6 +288,40 @@ class ReportPipelineStructureTest(unittest.TestCase):
 
         self.assertEqual([item['section_kind'] for item in result.items], ['chapter', 'unit'])
 
+    def test_title_planner_accepts_title_plans_list_output(self) -> None:
+        config = get_config().model_copy(deep=True)
+        config.llm.enabled = True
+        config.llm.api_key = 'test-key'
+        planner = ReportOutlinePlannerService(
+            config=config,
+            client=StubLLMClient(
+                {
+                    'title_plans': [
+                        {'title_id': 'p001-b001', 'role': 'toc'},
+                        {'title_id': 'p001-b002', 'role': 'ignore'},
+                        {'title_id': 'p001-b004', 'role': 'ignore'},
+                        {'title_id': 'p001-b006', 'role': 'ignore'},
+                        {'title_id': 'p001-b008', 'role': 'ignore'},
+                        {'title_id': 'p001-b010', 'role': 'ignore'},
+                    ]
+                }
+            ),
+        )
+
+        titles = [
+            {'title_id': 'p001-b001', 'title_index': 1, 'page_idx': 1, 'page_role': 'toc', 'text': '目录'},
+            {'title_id': 'p001-b002', 'title_index': 2, 'page_idx': 1, 'page_role': 'toc', 'text': '1 基本情况 …… 1'},
+            {'title_id': 'p001-b004', 'title_index': 3, 'page_idx': 1, 'page_role': 'toc', 'text': '2 现场安全检查及安全检测 …… 12'},
+            {'title_id': 'p001-b006', 'title_index': 4, 'page_idx': 1, 'page_role': 'toc', 'text': '3 安全监测资料分析 ……29'},
+            {'title_id': 'p001-b008', 'title_index': 5, 'page_idx': 1, 'page_role': 'toc', 'text': '4 工程质量评价 …… 37'},
+            {'title_id': 'p001-b010', 'title_index': 6, 'page_idx': 1, 'page_role': 'toc', 'text': '5 运行管理评价 ……64'},
+        ]
+
+        result = planner.plan_titles('report-doc', titles)
+
+        self.assertEqual(len(result.items), 6)
+        self.assertEqual([item['section_kind'] for item in result.items], ['toc', 'ignore', 'ignore', 'ignore', 'ignore', 'ignore'])
+
     def test_pipeline_accepts_prefixed_content_list_v2_file(self) -> None:
         content_list_path = self.artifact_dir / 'content_list_v2.json'
         prefixed_path = self.artifact_dir / '6799bb12-32ae-45c0-ac6a-9eaf395f0a35_content_list_v2.json'

@@ -17,11 +17,12 @@ from core.config import get_config
 from services.standard_pipeline import StandardPipelineService
 
 
-class StubStandardTitleClassifier:
+class StubStandardOutlinePlanner:
     def __init__(self, items: list[dict]) -> None:
         self.items = items
+        self.enabled = True
 
-    def classify_titles(self, *, standard_uid: str, title_inventory: list[dict]) -> object:
+    def plan_titles(self, *, standard_uid: str, title_inventory: list[dict]) -> object:
         del standard_uid, title_inventory
         return type(
             "StubResult",
@@ -30,10 +31,11 @@ class StubStandardTitleClassifier:
                 "items": self.items,
                 "warnings": [],
                 "metrics": {
-                    "title_classifier_requested_count": len(self.items),
-                    "title_classifier_batch_count": 1,
-                    "title_classifier_successful_count": len(self.items),
-                    "title_classifier_label_counts": {},
+                    "title_planner_requested_count": len(self.items),
+                    "title_planner_batch_count": 1,
+                    "title_planner_successful_count": len(self.items),
+                    "title_planner_failed_batch_count": 0,
+                    "title_planner_role_counts": {},
                 },
             },
         )()
@@ -96,17 +98,17 @@ class StandardPipelineChapterSummaryTest(unittest.TestCase):
         config.knowledge_graph.extraction_mode = "heuristic"
         config.knowledge_graph.generate_chapter_summaries = True
 
-        classifier = StubStandardTitleClassifier(
+        planner = StubStandardOutlinePlanner(
             items=[
-                {"title_id": "p001-b001", "label": "chapter", "confidence": 0.99, "rationale": "一级章节"},
-                {"title_id": "p001-b002", "label": "clause", "confidence": 0.99, "rationale": "条文"},
-                {"title_id": "p001-b003", "label": "chapter", "confidence": 0.99, "rationale": "一级章节"},
-                {"title_id": "p001-b004", "label": "clause", "confidence": 0.99, "rationale": "条文"},
+                {"title_id": "p001-b001", "role": "chapter", "ref": "1", "confidence": 0.99, "rationale": "一级章节"},
+                {"title_id": "p001-b002", "role": "clause", "ref": "1.0.1", "confidence": 0.99, "rationale": "条文"},
+                {"title_id": "p001-b003", "role": "chapter", "ref": "2", "confidence": 0.99, "rationale": "一级章节"},
+                {"title_id": "p001-b004", "role": "clause", "ref": "2.0.1", "confidence": 0.99, "rationale": "条文"},
             ]
         )
         service = StandardPipelineService(
             config=config,
-            title_classification_service=classifier,
+            outline_planner=planner,
             chapter_summary_service=StubChapterSummaryService(),
         )
         output = service.run(self.artifact_dir, "sl-test:2026")

@@ -13,6 +13,7 @@ from typing import Any
 from adapters.llm_client import ResponsesAPIClient
 from core.config import AppConfig, get_config
 from services.report_outline_planner import ReportOutlinePlannerService
+from services.report_section_summary_service import ReportSectionSummaryService
 
 
 CHINESE_SPACED_RE = re.compile(r'(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])')
@@ -49,11 +50,17 @@ class ReportPipelineService:
         self,
         config: AppConfig | None = None,
         outline_planner: ReportOutlinePlannerService | None = None,
+        section_summary_service: ReportSectionSummaryService | None = None,
     ) -> None:
         self.config = config or get_config()
+        llm_client = ResponsesAPIClient(self.config)
         self.outline_planner = outline_planner or ReportOutlinePlannerService(
             self.config,
-            ResponsesAPIClient(self.config),
+            llm_client,
+        )
+        self.section_summary_service = section_summary_service or ReportSectionSummaryService(
+            self.config,
+            llm_client,
         )
 
     def run(self, artifact_dir: Path, document_id: str) -> ReportPipelineOutput:
@@ -81,6 +88,15 @@ class ReportPipelineService:
         metrics['title_plan_warning_count'] = len(title_plan_warnings)
         if title_plan_warnings:
             metrics['title_plan_warnings'] = title_plan_warnings
+        section_summary_metrics, section_summary_warnings = self._generate_report_section_summaries(
+            document_id=document_id,
+            sections=sections,
+            report_units=report_units,
+        )
+        metrics.update(section_summary_metrics)
+        metrics['report_section_summary_warning_count'] = len(section_summary_warnings)
+        if section_summary_warnings:
+            metrics['report_section_summary_warnings'] = section_summary_warnings
         report_nodes, report_edges, embedding_documents = self._materialize_report_graph(
             document_id=document_id,
             sections=sections,
@@ -611,6 +627,35 @@ class ReportPipelineService:
         metrics['figure_count'] = len(figures)
         metrics['front_matter_unit_count'] = sum(1 for unit in report_units if unit.get('page_role') == 'front_matter')
         return sections, report_units, tables, figures, metrics
+
+    def _generate_report_section_summaries(
+        self,
+        *,
+        document_id: str,
+        sections: list[dict[str, Any]],
+        report_units: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], list[str]]:
+        result = self.section_summary_service.summarize_sections(
+            document_id=document_id,
+            sections=sections,
+            report_units=report_units,
+        )
+        for section in sections:
+            section_uid = str(section.get('section_uid') or '')
+            item = result.section_items.get(section_uid)
+            if not item:
+                section['summary'] = ''
+                section['summary_overall'] = ''
+                section['unit_summaries'] = []
+                section['summary_source_unit_count'] = 0
+                section['summary_source_truncated'] = False
+                continue
+            section['summary'] = item.get('summary') or ''
+            section['summary_overall'] = item.get('summary_overall') or ''
+            section['unit_summaries'] = item.get('unit_summaries') or []
+            section['summary_source_unit_count'] = int(item.get('summary_source_unit_count') or 0)
+            section['summary_source_truncated'] = bool(item.get('summary_source_truncated'))
+        return result.metrics, result.warnings
 
     def _materialize_report_graph(
         self,

@@ -7,7 +7,7 @@ import logging
 import time
 from typing import Any, Sequence
 
-from adapters.llm_client import ResponseAPIError, ResponsesAPIClient
+from adapters.llm_client import ResponseAPIError, ResponseAPIOutputError, ResponsesAPIClient
 from core.config import AppConfig
 from prompts import LLM_REQUIREMENT_EXTRACTION_SYSTEM_PROMPT, build_clause_extraction_prompt
 
@@ -32,6 +32,15 @@ class BatchExecutionResult:
     retries_used: int = 0
 
 
+@dataclass
+class ClauseExecutionResult:
+    clause_index: int
+    clause: dict[str, Any]
+    item: dict[str, Any] | None = None
+    error: str | None = None
+    retries_used: int = 0
+
+
 class LLMGraphExtractionService:
     def __init__(self, config: AppConfig, client: ResponsesAPIClient) -> None:
         self.config = config
@@ -52,15 +61,21 @@ class LLMGraphExtractionService:
         )
 
     def extract_clauses(self, standard_uid: str, clauses: Sequence[dict[str, Any]]) -> LLMExtractionResult:
+        return self.extract_clauses_individually(standard_uid, clauses)
+
+    def extract_clauses_individually(self, standard_uid: str, clauses: Sequence[dict[str, Any]]) -> LLMExtractionResult:
         if not clauses:
             return LLMExtractionResult(
                 metrics={
                     "requested_clause_count": 0,
-                    "batch_count": 0,
+                    "clause_call_count": 0,
                     "successful_clause_count": 0,
                     "failed_clause_count": 0,
-                    "retried_batch_count": 0,
+                    "retried_clause_count": 0,
                     "retry_attempt_count": 0,
+                    "failed_clause_call_count": 0,
+                    "batch_count": 0,
+                    "retried_batch_count": 0,
                     "failed_batch_count": 0,
                 }
             )
@@ -73,46 +88,38 @@ class LLMGraphExtractionService:
                 warnings=[warning],
                 metrics={
                     "requested_clause_count": len(clauses),
-                    "batch_count": 0,
+                    "clause_call_count": 0,
                     "successful_clause_count": 0,
                     "failed_clause_count": len(clauses),
-                    "retried_batch_count": 0,
+                    "retried_clause_count": 0,
                     "retry_attempt_count": 0,
+                    "failed_clause_call_count": 0,
+                    "batch_count": 0,
+                    "retried_batch_count": 0,
                     "failed_batch_count": 0,
                 },
             )
 
-        batch_size = max(1, self.config.llm.clause_batch_size)
         clause_items: dict[str, dict[str, Any]] = {}
         failed_clause_uids: list[str] = []
         warnings: list[str] = []
-        batches = [list(clauses[index : index + batch_size]) for index in range(0, len(clauses), batch_size)]
-        batch_results = self._run_batches(standard_uid, batches)
+        clause_results = self._run_clause_calls(standard_uid, list(clauses))
 
-        for batch_result in batch_results:
-            if batch_result.error is not None:
-                failed_clause_uids.extend(clause["clause_uid"] for clause in batch_result.batch)
-                warnings.append(f"batch_{batch_result.batch_index}: {batch_result.error}")
+        for clause_result in clause_results:
+            clause = clause_result.clause
+            if clause_result.error is not None:
+                failed_clause_uids.append(clause["clause_uid"])
+                warnings.append(f"clause_{clause_result.clause_index}:{clause['clause_uid']}: {clause_result.error}")
                 continue
+            if clause_result.item is None:
+                failed_clause_uids.append(clause["clause_uid"])
+                warnings.append(f"clause_{clause_result.clause_index}:{clause['clause_uid']}: missing structured output")
+                continue
+            clause_items[clause["clause_uid"]] = clause_result.item
 
-            payload = batch_result.payload or {"items": []}
-            returned_items = payload.get("items") or []
-            returned_by_uid = {
-                item.get("clause_uid"): item
-                for item in returned_items
-                if isinstance(item, dict) and item.get("clause_uid")
-            }
-            for clause in batch_result.batch:
-                item = returned_by_uid.get(clause["clause_uid"])
-                if item is None:
-                    failed_clause_uids.append(clause["clause_uid"])
-                    warnings.append(f"batch_{batch_result.batch_index}: missing structured output for {clause['clause_uid']}")
-                    continue
-                clause_items[clause["clause_uid"]] = item
-
-        retried_batch_count = sum(1 for result in batch_results if result.retries_used > 0)
-        retry_attempt_count = sum(result.retries_used for result in batch_results)
-        failed_batch_count = sum(1 for result in batch_results if result.error is not None)
+        retried_clause_count = sum(1 for result in clause_results if result.retries_used > 0)
+        retry_attempt_count = sum(result.retries_used for result in clause_results)
+        failed_call_count = sum(1 for result in clause_results if result.error is not None)
 
         return LLMExtractionResult(
             clause_items=clause_items,
@@ -120,14 +127,124 @@ class LLMGraphExtractionService:
             warnings=warnings,
             metrics={
                 "requested_clause_count": len(clauses),
-                "batch_count": len(batches),
+                "clause_call_count": len(clause_results),
                 "successful_clause_count": len(clause_items),
                 "failed_clause_count": len(failed_clause_uids),
-                "retried_batch_count": retried_batch_count,
+                "retried_clause_count": retried_clause_count,
                 "retry_attempt_count": retry_attempt_count,
-                "failed_batch_count": failed_batch_count,
-                "batch_max_concurrency": max(1, min(self.config.llm.batch_max_concurrency, len(batches))),
+                "failed_clause_call_count": failed_call_count,
+                "batch_count": 0,
+                "retried_batch_count": 0,
+                "failed_batch_count": 0,
+                "batch_max_concurrency": max(1, min(self.config.llm.batch_max_concurrency, len(clause_results))),
             },
+        )
+
+    def _run_clause_calls(self, standard_uid: str, clauses: list[dict[str, Any]]) -> list[ClauseExecutionResult]:
+        if not clauses:
+            return []
+
+        max_concurrency = max(1, min(self.config.llm.batch_max_concurrency, len(clauses)))
+        logger.info(
+            "Running %s per-clause LLM extraction call(s) with concurrency=%s, max_retries=%s.",
+            len(clauses),
+            max_concurrency,
+            self.config.llm.batch_max_retries,
+        )
+        if max_concurrency == 1:
+            return [
+                self._execute_clause_with_retries(standard_uid=standard_uid, clause_index=clause_index, clause=clause)
+                for clause_index, clause in enumerate(clauses, start=1)
+            ]
+
+        results: list[ClauseExecutionResult] = []
+        with futures.ThreadPoolExecutor(max_workers=max_concurrency, thread_name_prefix="llm-clause") as executor:
+            submitted = [
+                executor.submit(self._execute_clause_with_retries, standard_uid=standard_uid, clause_index=clause_index, clause=clause)
+                for clause_index, clause in enumerate(clauses, start=1)
+            ]
+            for future in futures.as_completed(submitted):
+                results.append(future.result())
+        results.sort(key=lambda item: item.clause_index)
+        return results
+
+    def _execute_clause_with_retries(
+        self,
+        *,
+        standard_uid: str,
+        clause_index: int,
+        clause: dict[str, Any],
+    ) -> ClauseExecutionResult:
+        max_retries = max(0, self.config.llm.batch_max_retries)
+        max_attempts = max_retries + 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                raw_payload = self.extract_clause_batch(standard_uid, [clause])
+                payload = self._normalize_batch_payload(raw_payload)
+                returned_items = payload.get("items") or []
+                returned_by_uid = {
+                    item.get("clause_uid"): item
+                    for item in returned_items
+                    if isinstance(item, dict) and item.get("clause_uid")
+                }
+                item = returned_by_uid.get(clause["clause_uid"])
+                if item is None:
+                    raise ResponseAPIError(f"missing structured output for {clause['clause_uid']}")
+                if attempt > 1:
+                    logger.info(
+                        "LLM extraction clause %s succeeded on retry attempt %s/%s.",
+                        clause_index,
+                        attempt,
+                        max_attempts,
+                    )
+                return ClauseExecutionResult(
+                    clause_index=clause_index,
+                    clause=dict(clause),
+                    item=item,
+                    retries_used=attempt - 1,
+                )
+            except ResponseAPIError as exc:
+                error_text = self._format_response_error(exc)
+                if attempt >= max_attempts:
+                    logger.warning(
+                        "LLM extraction failed for clause %s after %s attempt(s): %s",
+                        clause_index,
+                        attempt,
+                        error_text,
+                    )
+                    return ClauseExecutionResult(
+                        clause_index=clause_index,
+                        clause=dict(clause),
+                        error=error_text,
+                        retries_used=attempt - 1,
+                    )
+                logger.warning(
+                    "Retrying LLM extraction clause %s after attempt %s/%s: %s",
+                    clause_index,
+                    attempt,
+                    max_attempts,
+                    error_text,
+                )
+                self._sleep_before_retry(attempt)
+            except Exception as exc:  # pragma: no cover - defensive path for API/runtime errors
+                logger.exception(
+                    "Unexpected error during LLM extraction clause %s attempt %s/%s",
+                    clause_index,
+                    attempt,
+                    max_attempts,
+                )
+                return ClauseExecutionResult(
+                    clause_index=clause_index,
+                    clause=dict(clause),
+                    error=str(exc),
+                    retries_used=attempt - 1,
+                )
+
+        return ClauseExecutionResult(
+            clause_index=clause_index,
+            clause=dict(clause),
+            error="Clause execution ended without result.",
+            retries_used=max_retries,
         )
 
     def _run_batches(self, standard_uid: str, batches: list[list[dict[str, Any]]]) -> list[BatchExecutionResult]:
@@ -185,17 +302,18 @@ class LLMGraphExtractionService:
                     retries_used=attempt - 1,
                 )
             except ResponseAPIError as exc:
+                error_text = self._format_response_error(exc)
                 if attempt >= max_attempts:
                     logger.warning(
                         "LLM extraction failed for batch %s after %s attempt(s): %s",
                         batch_index,
                         attempt,
-                        exc,
+                        error_text,
                     )
                     return BatchExecutionResult(
                         batch_index=batch_index,
                         batch=list(batch),
-                        error=str(exc),
+                        error=error_text,
                         retries_used=attempt - 1,
                     )
                 logger.warning(
@@ -203,7 +321,7 @@ class LLMGraphExtractionService:
                     batch_index,
                     attempt,
                     max_attempts,
-                    exc,
+                    error_text,
                 )
                 self._sleep_before_retry(attempt)
             except Exception as exc:  # pragma: no cover - defensive path for API/runtime errors
@@ -231,6 +349,17 @@ class LLMGraphExtractionService:
         delay_seconds = max(0.0, self.config.llm.batch_retry_backoff_seconds) * attempt
         if delay_seconds > 0:
             time.sleep(delay_seconds)
+
+    def _format_response_error(self, exc: ResponseAPIError) -> str:
+        message = str(exc)
+        if isinstance(exc, ResponseAPIOutputError):
+            parts = [message]
+            if exc.raw_text is not None:
+                parts.append(f"raw_text_preview={exc.raw_text[:3000]}")
+            if exc.payload is not None:
+                parts.append(f"response_payload_preview={self._payload_preview(exc.payload)}")
+            return " | ".join(parts)
+        return message
 
     def _normalize_batch_payload(self, payload: Any) -> dict[str, list[dict[str, Any]]]:
         if isinstance(payload, dict):

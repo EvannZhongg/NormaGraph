@@ -63,7 +63,7 @@ def build_xml_system_prompt() -> str:
 4. 如果没有规范性要求，仍然要输出该 item，并让 <requirements /> 为空。
 5. requirement 节点内允许包含：
    <requirement_text> <modality> <subject> <action_list> <object_list> <applicability_rule>
-   <judgement_criteria_list> <evidence_expected_list> <domain_tags_list> <cited_targets> <confidence>
+   <judgement_criteria_list> <evidence_expected_list> <domain_tags_list> <cited_targets>
 6. modality 只能是 must、should、may、forbidden、conditional 之一。
 7. 不要遗漏任何输入 clause_uid。
 """

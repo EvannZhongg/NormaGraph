@@ -1,267 +1,94 @@
 # NormaGraph
 
-面向规范文档知识图谱构建、图谱浏览和后续 Retrieval / QA / 对比能力扩展的最小可运行原型。
+NormaGraph 是一个面向水库大坝安全评价场景的规范知识图谱与报告对比原型系统。它把规范、报告等 PDF / DOC / DOCX 文档解析为结构化 artifact，再派生出规范图谱、报告章节单元和报告-规范对比结果，并通过 FastAPI + React Web UI 以单服务形态运行。
 
 ## 当前架构
 
-当前项目已经切换为单服务部署架构：
+项目采用“前后端分离开发、单服务部署”的结构：
 
-- 后端使用 FastAPI
-- 前端源码使用 React + Vite + Tailwind CSS，位于 `frontend/`
-- 前端构建产物输出到 `webui/`
-- FastAPI 在生产形态下直接静态托管 `webui/`
-- 根路径 `/` 自动重定向到 `/webui/`
-- 前端所有 API 请求都走同域相对路径，不保留独立前端生产服务器
+- 后端：FastAPI，入口位于 `src/main.py`
+- 前端源码：React + Vite + Tailwind CSS，位于 `frontend/`
+- 前端构建产物：输出到 `webui/`，由 FastAPI 挂载到 `/webui`
+- API：集中在 `src/api/routes.py`
+- 数据产物：默认写入 `data/`
+- 配置：运行参数在 `config.yaml`，密钥从 `.env` 读取
+
+```mermaid
+flowchart LR
+    A[PDF / DOC / DOCX] --> B[NormalizationService]
+    B --> C[MinerU API]
+    C --> D[data/artifacts/document_id]
+    D --> E{documentType}
+    E -->|standard| F[StandardPipelineService]
+    F --> G[data/kg_spaces/standard_id]
+    G --> H[graph_nodes / graph_edges / requirements]
+    H --> I[Knowledge Graph API / Web UI]
+    E -->|report| J[ReportPipelineService]
+    J --> K[data/report_spaces/document_id]
+    K --> L[Report Comparison Agent]
+    G --> L
+    L --> M[comparison results]
+```
+
+## 代码分层
+
+- `src/main.py`：应用装配、依赖初始化、Web UI 静态资源挂载
+- `src/api/routes.py`：HTTP 路由、请求参数解析、错误映射
+- `src/core/config.py`：`.env + config.yaml` 加载、运行目录解析
+- `src/core/logging.py`：日志配置
+- `src/adapters/mineru_client.py`：MinerU 在线解析 API 适配
+- `src/adapters/llm_client.py`：OpenAI 兼容 `responses` / `embeddings` 客户端
+- `src/models/schemas.py`：FastAPI / Pydantic 数据模型
+- `src/repositories/job_store.py`：任务状态 JSON 存储
+- `src/repositories/standard_registry.py`：标准注册表
+- `src/repositories/postgres_graph_store.py`：PostgreSQL / pgvector 可选落库
+- `src/services/ingestion_service.py`：任务调度、上传、重试、删除、artifact 归档、图谱与报告空间查询
+- `src/services/normalization.py`：输入文档标准化与本地预处理入口
+- `src/services/standard_pipeline.py`：规范结构恢复、条文切分、requirements 抽取、图谱物化编排
+- `src/services/report_pipeline.py`：报告结构规划、章节与 report unit 切分
+- `src/services/report_comparison_agent.py`：报告单元到规范条款的路由、发现、覆盖/违反判断
+- `src/services/graph_materialization.py`：节点、边、embedding 输入物化
+- `src/resources/schemas/`：LLM 结构化输出 JSON Schema
+- `scripts/`：前台调试、离线建图、PostgreSQL 初始化等脚本
+- `tests/`：标准流水线、报告流水线、报告对比与 LLM 兼容性测试
+- `viewer/`：旧版静态图谱查看器
+- `docs/`：架构与策略说明
 
 ## 当前能力
 
-已完成：
+已实现：
 
-- 支持 PDF / DOC / DOCX 输入，统一进入标准化与解析流程
-- 对接 MinerU 在线 API，归档 `content_list_v2.json` 等解析产物
-- 文档解析 artifact 固定保留在 `data/artifacts/<document_id>/`
-- 标准图谱派生产物保留在 `data/kg_spaces/<standard_id>/`
-- 完成 `content_list_v2.json -> 结构归一化 -> 条文切分 -> requirement extraction`
-- 标准主链路中的 `title` 识别在 `llm.enabled=true` 时走 LLM 判别，标签包括 `chapter / section / reference_standard / appendix / clause / none`
-- 支持 `heuristic / llm / hybrid` 三种抽取模式
-- 支持 embedding 本地输出与 PostgreSQL / pgvector 可选落库
-- 提供 Documents / Knowledge Graph / Retrieval / API 四个前端工作区
-- 提供文档上传、扫描、重试、删除、流水线状态查看
-- 提供 kg space 切换、节点搜索、子图加载、布局切换、节点/关系编辑
+- 支持 PDF / DOC / DOCX 上传或本地路径 ingestion
+- 对接 MinerU 在线 API，归档解析产物
+- 标准文档流水线：`content_list_v2.json -> 标题规划 -> 结构恢复 -> 条文切分 -> requirements 抽取 -> 图谱物化`
+- 报告文档流水线：LLM 标题规划、报告 section 与 report unit 切分、报告空间落盘
+- LLM 抽取支持 `heuristic / llm / hybrid` 模式，以及失败回退
+- 支持 chapter summary、report section summary 等辅助摘要
+- 支持 embedding 本地 JSONL 输出，可选 PostgreSQL / pgvector 落库
+- 支持 Documents、Report、Knowledge Graph、Retrieval、API 五个 Web UI 工作区
+- 支持图谱空间切换、节点搜索、局部子图、节点/关系编辑
+- 支持报告单元与规范图谱的比较，以及报告级比较任务文件落盘
 
-尚未完成：
+仍为占位或未完整产品化：
 
-- Retrieval 后端问答链路尚未实现
-- 报告对比工作流尚未实现
-- 报告证据块切分与规范要求对齐尚未实现
-- 多规范联合检索与跨图推理尚未实现
+- `POST /v1/qa/ask` 尚未实现，会返回 `501`
+- 旧版 `/v1/comparisons/*` 仍是预留接口，会返回 `501`
+- Retrieval 页面主要是参数与工作台占位，尚未接入正式问答检索链路
+- PostgreSQL / pgvector 仍是可选持久化路径，主读取链路以本地 JSON artifact 为主
 
-## 目录说明
+## 数据目录
 
-- `src/main.py`
-  - FastAPI 应用入口，同时挂载 `/webui`
-- `src/api/routes.py`
-  - HTTP 路由与接口暴露
-- `src/core/config.py`
-  - `.env + config.yaml` 配置加载
-- `src/adapters/mineru_client.py`
-  - MinerU 在线 API 适配层
-- `src/adapters/llm_client.py`
-  - OpenAI 兼容 `responses` / `embeddings` 客户端
-- `src/services/normalization.py`
-  - 文档标准化与本地预处理识别
-- `src/services/standard_pipeline.py`
-  - 规范建图主流水线
-- `src/services/standard_title_classification.py`
-  - 规范 `title` 的 LLM 判别服务
-- `src/services/ingestion_service.py`
-  - ingestion 任务调度、文档列表、kg space 查询与图谱编辑
-- `src/repositories/job_store.py`
-  - 任务状态存储
-- `src/repositories/standard_registry.py`
-  - 标准注册表
-- `frontend/`
-  - React + Vite + Tailwind 前端源码
-- `webui/`
-  - 前端构建产物，供 FastAPI 静态托管
-- `data/artifacts/`
-  - 文档解析产物目录
-- `data/kg_spaces/`
-  - 标准图谱空间目录
-- `scripts/test_ingestion_pipeline.py`
-  - 从源文件开始跑完整链路并打印日志
-- `scripts/run_standard_pipeline.py`
-  - 对已有 artifact 离线建图
-- `scripts/ensure_postgres_db.py`
-  - PostgreSQL 建库与 schema 初始化脚本
+默认存储布局如下：
 
-## 安装依赖
+- `data/jobs/`：ingestion 任务状态
+- `data/uploads/`：Web UI 上传的原始文件
+- `data/downloads/`：MinerU 下载结果临时工作目录
+- `data/artifacts/<document_id>/`：MinerU 与解析中间产物
+- `data/kg_spaces/<standard_id>/`：规范知识图谱空间
+- `data/report_spaces/<document_id>/`：报告切分、报告单元和对比结果
+- `data/registry/standards.json`：标准注册表
 
-先安装 Python 侧依赖并注册命令行入口：
-
-```powershell
-uv pip install --python .\.venv\Scripts\python.exe -e .
-```
-
-前端依赖安装：
-
-```powershell
-Set-Location frontend
-npm install
-Set-Location ..
-```
-
-如果当前 Windows 环境对全局 npm / uv 缓存权限比较严格，可以改用项目内缓存：
-
-```powershell
-Set-Location frontend
-npm install --cache .npm-cache --ignore-scripts --force
-Set-Location ..
-```
-
-## 前端构建
-
-前端源码位于 `frontend/`，构建产物输出到 `webui/`：
-
-```powershell
-Set-Location frontend
-npm run build
-Set-Location ..
-```
-
-构建完成后会生成：
-
-- `webui/index.html`
-- `webui/assets/*`
-
-如果只改了后端、不改前端，可以直接复用已有 `webui/` 构建产物。
-
-## 单服务启动
-
-完成 `uv pip install -e .` 之后，推荐直接使用统一入口启动：
-
-```powershell
-normagraph-server
-```
-
-这条命令会启动 Uvicorn + FastAPI 进程，并且：
-
-- 提供后端 API
-- 提供 Swagger / OpenAPI
-- 将已构建的前端静态资源挂载到 `/webui`
-- 在同一个终端持续输出服务日志和状态
-
-如果当前 shell 没有激活虚拟环境，也可以显式运行：
-
-```powershell
-.\.venv\Scripts\normagraph-server.exe
-```
-
-默认打开的入口：
-
-- Web UI: `http://127.0.0.1:8010/webui/`
-- 根路径重定向: `http://127.0.0.1:8010/`
-- Swagger: `http://127.0.0.1:8010/docs`
-- 健康检查: `http://127.0.0.1:8010/healthz`
-
-说明：
-
-- `normagraph-server` 本质上调用的是 `main:main`
-- 如果 `webui/` 不存在，后端仍可启动，但 `/webui` 会返回缺少构建产物的提示
-
-## 配置约定
-
-### `.env`
-
-至少会用到这些密钥：
-
-- `MINERU_API_KEY`
-- `LLM_API_KEY` 或 `config.yaml -> llm.api_key_env` 指定的变量名
-- `EMBED_API_KEY` 或 `config.yaml -> embedding.api_key_env` 指定的变量名
-- `POSTGRES_PASSWORD`
-
-### `config.yaml`
-
-当前已接入的配置域：
-
-- `server`
-- `storage`
-- `mineru`
-- `normalization`
-- `knowledge_graph`
-- `llm`
-- `embedding`
-- `postgres`
-
-重点说明：
-
-- `knowledge_graph.extraction_mode`
-  - 可选 `heuristic / llm / hybrid`
-- `llm.enabled`
-  - 控制主链路中的 LLM 能力开关；对标准文档来说，开启后会先用 LLM 判断 `title` 是否属于 `chapter / section / reference_standard / appendix / clause / none`
-- `knowledge_graph.fallback_to_heuristic_on_llm_error`
-  - LLM 失败时是否自动回退到启发式抽取
-- `embedding.enabled`
-  - 是否生成 embedding
-- `postgres.enabled`
-  - 是否写入 PostgreSQL / pgvector
-
-当前仓库中的 `config.yaml` 示例已经切到 DashScope 兼容接口：
-
-- LLM: `qwen3.5-plus`
-- Embedding: `text-embedding-v4`
-
-## 前台测试脚本
-
-推荐优先使用前台脚本排查问题，它会直接打印：
-
-- 标准化阶段
-- MinerU 上传 URL
-- OSS 上传阶段
-- 结果轮询阶段
-- 图谱构建阶段
-- 抽取 warning 与图谱统计
-- 最终产物路径
-
-### 从原始 PDF 开始跑完整链路
-
-```powershell
-.\.venv\Scripts\python.exe scripts\test_ingestion_pipeline.py `
-  --source-path "Doc/1_SL 258-2017 水库大坝安全评价导则.pdf" `
-  --document-type standard `
-  --standard-id sl258:2017
-```
-
-### 仅测试 MinerU 解析，不建图
-
-```powershell
-.\.venv\Scripts\python.exe scripts\test_ingestion_pipeline.py `
-  --source-path "Doc/1_SL 258-2017 水库大坝安全评价导则.pdf" `
-  --document-type standard `
-  --no-build-graph
-```
-
-### 强制启发式抽取
-
-```powershell
-.\.venv\Scripts\python.exe scripts\test_ingestion_pipeline.py `
-  --source-path "Doc/1_SL 258-2017 水库大坝安全评价导则.pdf" `
-  --document-type standard `
-  --standard-id sl258:2017 `
-  --disable-llm
-```
-
-## 已有 artifact 的离线建图
-
-如果 MinerU 结果已经存在，可以直接对 parse artifact 跑建图：
-
-```powershell
-.\.venv\Scripts\python.exe scripts\run_standard_pipeline.py --artifact-dir data\artifacts\<document_id> --standard-id sl258:2017
-```
-
-## PostgreSQL 初始化
-
-```powershell
-.\.venv\Scripts\python.exe scripts\ensure_postgres_db.py
-```
-
-如需临时强制执行一次：
-
-```powershell
-.\.venv\Scripts\python.exe scripts\ensure_postgres_db.py --force-enable
-```
-
-## 主要输出文件
-
-文档解析产物保留在 `data/artifacts/<document_id>/`：
-
-- `content_list_v2.json`
-- `full.md`
-- `layout.json`
-- `images/`
-- `*_origin.pdf` / `*_model.json` / `*_content_list.json`
-
-规范图谱空间产物生成在 `data/kg_spaces/<standard_id>/`：
+典型规范图谱输出：
 
 - `space_manifest.json`
 - `normalized_blocks.json`
@@ -275,73 +102,215 @@ normagraph-server
 - `segmentation_metrics.json`
 - `segmentation_report.md`
 
-其中与标题识别直接相关的字段包括：
+典型报告空间输出：
 
-- `segmentation_metrics.json -> title_classification_mode`
-  - `heuristic` 表示标题仍按规则识别
-  - `llm` 表示标题已按 LLM 判别进入主链路
-- `segmentation_metrics.json -> title_classifier_*`
-  - 记录标题判别请求数、批次数、成功数与标签分布
+- `space_manifest.json`
+- `sections.json`
+- `report_units.json`
+- `report_nodes.json`
+- `report_edges.json`
+- `tables.json`
+- `figures.json`
+- `segmentation_metrics.json`
+- `comparisons/<standard_id>.json`
 
-## 当前已实现接口
+## 安装
 
-基础接口：
+Python 依赖：
+
+```powershell
+uv pip install --python .\.venv\Scripts\python.exe -e .
+```
+
+前端依赖：
+
+```powershell
+Set-Location frontend
+npm install
+Set-Location ..
+```
+
+## 配置
+
+密钥放在 `.env`：
+
+```dotenv
+MINERU_API_KEY=...
+LLM_API_KEY=...
+EMBED_API_KEY=...
+POSTGRES_PASSWORD=...
+```
+
+运行参数放在 `config.yaml`，主要配置域包括：
+
+- `server`
+- `storage`
+- `mineru`
+- `normalization`
+- `knowledge_graph`
+- `llm`
+- `embedding`
+- `postgres`
+
+重要开关：
+
+- `knowledge_graph.extraction_mode`：`heuristic / llm / hybrid`
+- `knowledge_graph.fallback_to_heuristic_on_llm_error`：LLM 失败时是否回退规则抽取
+- `knowledge_graph.materialize_graph`：是否输出图谱节点与边
+- `llm.enabled`：是否启用 LLM 标题规划、抽取与报告对比能力
+- `embedding.enabled`：是否生成 embedding
+- `postgres.enabled`：是否写入 PostgreSQL / pgvector
+
+当前示例配置使用 DashScope OpenAI 兼容接口：
+
+- LLM：`qwen3.6-plus`
+- Embedding：`text-embedding-v4`
+
+## 前端构建
+
+```powershell
+Set-Location frontend
+npm run build
+Set-Location ..
+```
+
+构建产物会写入 `webui/`。如果只改后端，可以复用已有 `webui/`。
+
+## 启动服务
+
+安装 editable package 后可直接运行：
+
+```powershell
+normagraph-server
+```
+
+也可以显式调用虚拟环境内的入口：
+
+```powershell
+.\.venv\Scripts\normagraph-server.exe
+```
+
+默认地址：
+
+- Web UI: `http://127.0.0.1:8010/webui/`
+- 根路径: `http://127.0.0.1:8010/`
+- Swagger: `http://127.0.0.1:8010/docs`
+- OpenAPI JSON: `http://127.0.0.1:8010/openapi.json`
+- 健康检查: `http://127.0.0.1:8010/healthz`
+
+## 常用脚本
+
+从原始文件跑完整标准建图链路：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\test_ingestion_pipeline.py `
+  --source-path "Doc/1_SL 258-2017 水库大坝安全评价导则.pdf" `
+  --document-type standard `
+  --standard-id sl258:2017
+```
+
+只跑 MinerU 解析，不建图：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\test_ingestion_pipeline.py `
+  --source-path "Doc/1_SL 258-2017 水库大坝安全评价导则.pdf" `
+  --document-type standard `
+  --no-build-graph
+```
+
+对已有 artifact 离线重建规范图谱：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_standard_pipeline.py `
+  --artifact-dir data\artifacts\<document_id> `
+  --standard-id sl258:2017
+```
+
+对已有 artifact 离线生成报告空间：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_report_pipeline.py `
+  --artifact-dir data\artifacts\<document_id> `
+  --document-id <document_id>
+```
+
+初始化 PostgreSQL / pgvector：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\ensure_postgres_db.py
+```
+
+## 主要 API
+
+基础：
 
 - `GET /healthz`
-- `POST /v1/ingestions`
-- `GET /v1/ingestions/{jobId}`
+- `GET /health`
 
-标准与 requirements：
+任务与文档：
+
+- `POST /v1/ingestions`
+- `GET /v1/ingestions/{job_id}`
+- `GET /v1/documents`
+- `GET /v1/documents/{document_id}/jobs`
+- `POST /v1/documents/upload`
+- `POST /v1/documents/{document_id}/retry`
+- `DELETE /v1/documents/{document_id}`
+
+标准与图谱：
 
 - `GET /v1/standards`
-- `GET /v1/standards/{standardId}`
-- `GET /v1/standards/{standardId}/subgraph`
-- `GET /v1/requirements/{requirementId}`
-
-Documents：
-
-- `GET /v1/documents`
-- `GET /v1/documents/{documentId}/jobs`
-- `POST /v1/documents/upload`
-- `POST /v1/documents/{documentId}/retry`
-- `DELETE /v1/documents/{documentId}`
-
-Knowledge Graph：
-
+- `GET /v1/standards/{standard_id}`
+- `GET /v1/standards/{standard_id}/subgraph`
 - `GET /v1/kg-spaces`
-- `GET /v1/kg-spaces/{standardId}`
-- `GET /v1/kg-spaces/{standardId}/search`
-- `GET /v1/kg-spaces/{standardId}/subgraph`
-- `PATCH /v1/kg-spaces/{standardId}/nodes/{nodeId}`
-- `PATCH /v1/kg-spaces/{standardId}/edges/{edgeId}`
+- `GET /v1/kg-spaces/{standard_id}`
+- `GET /v1/kg-spaces/{standard_id}/search`
+- `GET /v1/kg-spaces/{standard_id}/subgraph`
+- `PATCH /v1/kg-spaces/{standard_id}/nodes/{node_id}`
+- `PATCH /v1/kg-spaces/{standard_id}/edges/{edge_id}`
+- `GET /v1/requirements/{requirement_id}`
 
-当前仍为预留，接口会返回 `501`：
+工作台图谱接口：
+
+- `GET /graphs` / `GET /v1/graphs`
+- `GET /graph/label/popular` / `GET /v1/graph/label/popular`
+- `GET /graph/label/search` / `GET /v1/graph/label/search`
+- `GET /graph/entity/exists` / `GET /v1/graph/entity/exists`
+- `POST /graph/entity/edit` / `POST /v1/graph/entity/edit`
+- `POST /graph/relation/edit` / `POST /v1/graph/relation/edit`
+
+报告空间与报告对比：
+
+- `GET /v1/report-spaces/{document_id}`
+- `POST /v1/report-spaces/{document_id}/comparisons`
+- `GET /v1/report-spaces/{document_id}/comparisons/{standard_id}`
+- `POST /v1/report-spaces/{document_id}/units/{unit_uid}/compare`
+
+仍为占位：
 
 - `POST /v1/qa/ask`
 - `POST /v1/comparisons`
-- `GET /v1/comparisons/{comparisonId}`
-- `GET /v1/comparisons/{comparisonId}/items`
+- `GET /v1/comparisons/{comparison_id}`
+- `GET /v1/comparisons/{comparison_id}/items`
 
-## 当前已知问题
+## 测试
 
-- MinerU 批任务创建成功后，仍可能在 OSS 上传阶段受本地网络环境影响
-- 某些 OpenAI 兼容端点对 `/responses` 的支持并不完整，可能导致结构化输出漂移、超时或回退到启发式抽取
-- 当 `llm.enabled=true` 时，标准文档的标题识别也会依赖同一个 `/responses` 兼容端点；如果兼容端点返回 shape 不稳定，标题判别阶段会直接报错，不会静默退回规则
-- 当 `embedding.enabled=true` 且 embedding 服务未就绪时，embedding 生成阶段会失败或超时
-- 当 `postgres.enabled=true` 且 PostgreSQL 服务不可达、凭据错误或当前账号没有建库/建表权限时，建图流程会在落库阶段报错
-- Retrieval / Comparison 后端尚未实现，前端页面当前为工作台占位和参数面板
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+```
 
-## 当前建议
+当前测试覆盖重点包括：
 
-- 日常使用优先走 `normagraph-server` 单服务入口
-- 前端改动后先执行 `frontend\npm run build`，再启动服务
-- 排查解析或网络问题时，优先用 `scripts/test_ingestion_pipeline.py`
-- 对已有 MinerU 产物做纯建图验证时，优先用 `scripts/run_standard_pipeline.py`
-- 如果当前兼容端点对 `/responses` 支持不稳定，先保持 `fallback_to_heuristic_on_llm_error=true`
-- （日志后续要更新为中文，加进度显示）
-- （报告对规范图谱的覆盖率计算）
-- （图rag）
+- 标准文档标题规划、章节摘要、表格归属和 requirement 切分
+- LLM 抽取失败信息与返回 shape 兼容
+- 报告标题规划、report unit 切分
+- 报告对比路由、失败 fallback、并发、IO 原子写入和 clause 聚合
 
+## 已知边界
 
-## 限制
-- 当前调用MinerU的api，处理文本必须小于200页。
+- MinerU 当前在线 API 处理能力受其服务限制影响，长文档和网络上传阶段可能失败。
+- 当前业务约束中，MinerU 处理文本建议小于 200 页。
+- OpenAI 兼容端点对 `/responses` 与结构化输出的兼容程度不一，可能出现超时、返回 shape 漂移或解析失败。
+- `fallback_to_heuristic_on_llm_error=true` 可以保证标准建图链路尽量闭环，但质量不等价于稳定 LLM 抽取。
+- 报告对比依赖规范图谱、报告空间和 LLM 路由质量；存在 failed units 时，coverage 不应视为最终结论。
+- 当 `embedding.enabled=true` 或 `postgres.enabled=true` 时，需要确保对应服务、密钥和权限可用。

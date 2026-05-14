@@ -14,9 +14,8 @@ LLM_REQUIREMENT_EXTRACTION_SYSTEM_PROMPT = """你是水利水电规范知识图�
 5. requirement_text 采用中文，尽量保留原句表达；subject/action/object/applicability_rule/judgement_criteria/evidence_expected/domain_tags 是对 requirement_text 的结构化解释。
 6. modality 只能是 must、should、may、forbidden、conditional 之一。
 7. cited_targets 只填写条文中明确出现的外部标准编号或条款号；没有明确引用则返回空数组。
-8. confidence 取 0 到 1 之间的小数，表示你对该 requirement 抽取正确性的信心。
-9. 对每个输入条文都必须返回一个结果项，使用原样的 clause_uid 和 clause_ref；如果没有规范性要求，则 requirements 返回空数组。
-10. 输出必须严格满足给定 JSON Schema。"""
+8. 对每个输入条文都必须返回一个结果项，使用原样的 clause_uid 和 clause_ref；如果没有规范性要求，则 requirements 返回空数组。
+9. 输出必须严格满足给定 JSON Schema。"""
 
 
 LLM_REPORT_TITLE_PLANNING_SYSTEM_PROMPT = """你是水利水电工程安全评价报告的标题规划器。输入来自 PDF 解析后被标为 title 的文本块，其中很多并不是真正的报告标题。你的任务是生成稳定、保守的 title plan，用于后续切分正文。
@@ -39,6 +38,31 @@ LLM_REPORT_TITLE_PLANNING_SYSTEM_PROMPT = """你是水利水电工程安全评�
 8. 如果无法可靠判断，优先 ignore；宁可少切分，也不要产生过细 unit。
 9. 必须为每个输入 title_id 返回一条结果，不能遗漏，title_id 必须原样保留。
 10. 输出必须严格满足给定 JSON Schema，只输出 JSON。"""
+
+
+LLM_STANDARD_TITLE_PLANNING_SYSTEM_PROMPT = """你是水利水电工程规范的标题规划器。输入来自 PDF 解析后被标为 title 的文本块，其中可能混有目录项、页眉页脚、正文条文、附录标题和噪声。你的任务是生成稳定、保守的 title plan，用于后续规范图谱抽取的结构切分。
+
+只允许输出以下 role：
+- toc: 只有“目录”标题本身。
+- appendix: 附录、附件、附表、附图等附属结构标题。
+- reference_standard: “引用标准 / 规范性引用文件”这类章节。
+- chapter: 正文主体一级章，例如 1 总则、7 防洪能力复核。
+- section: 章下二级节，例如 2.1、7.3；规范结构只保留 chapter / section / clause 三层。
+- clause: 规范条文层，例如 1.0.1、2.3.4。即使 OCR 把条文误标为 title，也必须判为 clause。
+- ignore: 目录条目、封面标题、页眉页脚、图表题、列项、噪声、正文中的局部短语。
+
+判别要求：
+1. 目录页上只有“目录”标题本身判为 toc，其余目录条目全部 ignore，即使看起来像 chapter、section 或 clause。
+2. 标准正文只建立三层：chapter / section / clause。1、2、3 这类一级编号通常是 chapter；1.1、2.3 通常是 section；1.0.1、2.3.4 通常是 clause。
+3. 如果文本语义上就是“引用标准 / 规范性引用文件”，优先判为 reference_standard，而不是普通 chapter。
+4. 如果文本本身像完整条文句子，或以 1.0.1 / 2.3.4 这类条款编号开头，优先判为 clause。
+5. 如果文本以 6.4.1～6.4.4、3.2.1-3.2.3 这类条款范围编号开头，本质上仍按 clause 处理。
+6. 只有明确是附录/附件/附表/附图时才能判为 appendix。
+7. `1）大坝坝顶`、`1、主坝`、`（1）评价依据`、`一、地形地貌` 等列举项或局部短语判为 ignore。
+8. ref 字段应填写对应编号：chapter 填 1，section 填 2.1，clause 填 2.1.3，appendix 填 A；无法可靠给出时填 null。
+9. 如果无法可靠判断，优先 ignore；不要用结构类兜底。
+10. 必须为每个输入 title_id 返回一条结果，不能遗漏，title_id 必须原样保留。
+11. 输出必须严格满足给定 JSON Schema，只输出 JSON。"""
 
 
 LLM_STANDARD_TITLE_CLASSIFICATION_SYSTEM_PROMPT = """你是规范标题判别器，负责识别 OCR / 版面分析输出中被标记为 title 的文本块，在规范结构中的真实角色。
@@ -71,6 +95,19 @@ LLM_CHAPTER_SUMMARY_SYSTEM_PROMPT = """你是规范章节摘要生成器，负�
 3. 不要逐条抄写所有 clause，也不要输出项目符号、编号列表或引用符号。
 4. 如果输入条文较少，就基于现有内容做保守总结，不要为了凑完整而虚构。
 5. 输出必须严格满足给定 JSON Schema。"""
+
+
+LLM_REPORT_SECTION_SUMMARY_SYSTEM_PROMPT = """你是水利水电工程安全评价报告的章节摘要生成器。输入来自 title planner 判断后的 report section 及其包含的 report unit 文本。
+
+任务：
+1. 为整个 section 生成一段中文总概括，用于后续规范 chapter / section 路由判断。
+2. 为输入中的每个 report unit 生成一段中文概括，帮助后续判断该 unit 应关联哪些规范范围。
+3. 总概括应综合 section 标题、路径、unit 标题和 unit 文本，说明本章评价对象、主要检查/复核主题、关键结论或问题类型。
+4. unit 概括应保留该 unit 的核心评价语义，不要只复述标题；表格 unit 应概括表格用途和主要信息类型。
+5. 只能依据输入内容总结，不能补写输入中不存在的工程事实、数值、缺陷、结论或整改措施。
+6. 不要大段照抄原文，不要输出 Markdown、编号列表或额外解释。
+7. 必须为每个输入 unit 返回一个 `unit_summaries` 项，`unit_uid` 必须原样复制。
+8. 输出必须严格满足给定 JSON Schema。"""
 
 
 def build_clause_extraction_prompt(standard_uid: str, clauses: Sequence[dict[str, Any]]) -> str:
@@ -137,6 +174,55 @@ def build_report_title_planning_prompt(
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def build_standard_title_planning_prompt(
+    standard_uid: str,
+    previous_titles: Sequence[dict[str, Any]],
+    current_titles: Sequence[dict[str, Any]],
+) -> str:
+    payload = {
+        "standard_uid": standard_uid,
+        "task": "请为当前批标题生成 title plan，判断其真实结构角色，供后续规范图谱切分使用。",
+        "role_definitions": {
+            "toc": "目录标题本身。",
+            "appendix": "附录、附件、附表、附图等附属结构标题。",
+            "reference_standard": "引用标准 / 规范性引用文件章节。",
+            "chapter": "正文一级章，例如 1 总则。",
+            "section": "章下二级节，例如 2.1 一般规定。",
+            "clause": "规范条文，例如 2.1.3 应符合……。",
+            "ignore": "目录条目、封面标题、页眉页脚、图表题、列项、噪声或局部短语。",
+        },
+        "previous_decisions": [
+            {
+                "title_id": item.get("title_id"),
+                "text": item.get("text"),
+                "page_idx": item.get("page_idx"),
+                "role": item.get("role"),
+                "ref": item.get("ref"),
+            }
+            for item in previous_titles
+        ],
+        "current_titles": [
+            {
+                "title_id": item.get("title_id"),
+                "title_index": item.get("title_index"),
+                "page_idx": item.get("page_idx"),
+                "page_role": item.get("page_role"),
+                "text": item.get("text"),
+                "text_normalized": item.get("text_normalized"),
+                "raw_title_level": item.get("raw_title_level"),
+                "previous_title": item.get("previous_title"),
+                "next_title": item.get("next_title"),
+                "preceding_text_preview": item.get("preceding_text_preview"),
+                "following_text_preview": item.get("following_text_preview"),
+                "numbering_pattern": item.get("numbering_pattern"),
+                "looks_structural": item.get("looks_structural"),
+            }
+            for item in current_titles
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def build_standard_title_classification_prompt(
     standard_uid: str,
     previous_titles: Sequence[dict[str, Any]],
@@ -194,6 +280,42 @@ def build_chapter_summary_prompt(
                 "source_text_normalized": clause.get("source_text_normalized") or clause.get("source_text"),
             }
             for clause in clauses
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def build_report_section_summary_prompt(
+    document_id: str,
+    section: dict[str, Any],
+    units: Sequence[dict[str, Any]],
+) -> str:
+    payload = {
+        "document_id": document_id,
+        "task": "根据 title planner 切出的 report section 和其下 report units 生成路由辅助摘要。",
+        "output_usage": "该摘要会作为 Run Evaluation 中 report section 第一次规范路由的主要输入。",
+        "required_summary_format": {
+            "overall_summary": "一段总概括。",
+            "unit_summaries": "每个 unit 一段概括，必须覆盖所有输入 unit_uid。",
+        },
+        "section": {
+            "section_uid": section.get("section_uid"),
+            "title": section.get("title"),
+            "section_kind": section.get("section_kind"),
+            "path": section.get("path") or [],
+            "structural_path": section.get("structural_path") or [],
+            "page_span": section.get("page_span") or [],
+        },
+        "units": [
+            {
+                "unit_uid": unit.get("unit_uid"),
+                "title": unit.get("title"),
+                "unit_type": unit.get("unit_type"),
+                "local_heading_path": unit.get("local_heading_path") or [],
+                "source_page_span": unit.get("source_page_span") or [],
+                "text": unit.get("text_for_summary") or "",
+            }
+            for unit in units
         ],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)

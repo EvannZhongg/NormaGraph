@@ -83,14 +83,15 @@ def build_report_chapter_routing_system_prompt() -> str:
     return """你是水利水电报告比对代理中的章节路由器。
 
 任务：
-1. 根据报告分块文本，从候选规范 chapter 中选择最相关的章节。
+1. 根据报告分块文本，从候选规范 chapter 中选择最相关的章节。输入可能是单个 `report_unit`，也可能是整章 `report_section`。
 2. 只选择后续值得深入比对的章节，通常 1 到 4 个。
 3. 优先依据语义主题、工程对象、安全类别、检查事项来选择，不要机械依赖关键词单字重合。
 4. 候选 chapter 中如果提供 `summary` 字段，应把它作为章节内容摘要参考，与标题一起综合判断。
 5. 如果报告分块涉及缺陷、措施、结论、监测、复核等内容，也要映射到真正约束该内容的规范章节。
-6. 输出中的 chapter id 必须直接复制自输入 `candidate_chapters[].id`，不得改写、缩写、解释或生成新 id。
-7. `reasoning` 只写简短中文说明，不要粘贴原文，不要使用双引号，不要输出嵌套对象。
-8. 输出必须严格满足给定 JSON Schema。"""
+6. 当输入是 `report_section` 时，只使用其中的 `section_title`、`section_path`、`unit_titles`、`section_text` 判断范围；`section_text` 是路由辅助摘要，不是截断原文。
+7. 输出中的 chapter id 必须直接复制自输入 `candidate_chapters[].id`，不得改写、缩写、解释或生成新 id。
+8. `reasoning` 只写简短中文说明，不要粘贴原文，不要使用双引号，不要输出嵌套对象。
+9. 输出必须严格满足给定 JSON Schema。"""
 
 
 def build_report_section_routing_system_prompt() -> str:
@@ -146,10 +147,11 @@ def build_report_violated_summary_text_system_prompt() -> str:
 
 
 def build_report_chapter_routing_prompt(report_unit: dict[str, Any], chapters: list[dict[str, Any]]) -> str:
+    scope_key = _report_scope_key(report_unit)
     return _json_payload(
         {
             "task": "从候选章节中选择与该报告分块最相关的规范 chapter。",
-            "report_unit": _report_scope_payload(report_unit),
+            scope_key: _report_scope_payload(report_unit),
             "candidate_chapters": chapters,
         }
     )
@@ -160,10 +162,11 @@ def build_report_section_routing_prompt(
     chapters: list[dict[str, Any]],
     sections: list[dict[str, Any]],
 ) -> str:
+    scope_key = _report_scope_key(report_unit)
     return _json_payload(
         {
             "task": "在已选章节范围内，选择最相关的规范 section。",
-            "report_unit": _report_scope_payload(report_unit),
+            scope_key: _report_scope_payload(report_unit),
             "selected_chapters": chapters,
             "candidate_sections": sections,
         }
@@ -240,20 +243,28 @@ def _report_scope_payload(report_unit: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _report_scope_key(report_scope: dict[str, Any]) -> str:
+    return "report_section" if report_scope.get("scope_uid") else "report_unit"
+
+
 def _report_section_scope_payload(report_scope: dict[str, Any]) -> dict[str, Any]:
     return {
-        "section_title": report_scope.get("title"),
-        "section_path": report_scope.get("section_path") or report_scope.get("sectionPath") or [],
-        "unit_titles": report_scope.get("unit_titles") or report_scope.get("unitTitles") or [],
-        "section_text": (
+        "section_title": str(report_scope.get("title") or "").strip(),
+        "section_path": _coerce_text_list(report_scope.get("section_path") or report_scope.get("sectionPath") or []),
+        "unit_titles": _coerce_text_list(report_scope.get("unit_titles") or report_scope.get("unitTitles") or []),
+        "section_text": str(
             report_scope.get("text_summary")
+            or report_scope.get("textSummary")
             or report_scope.get("summary")
-            or report_scope.get("text_normalized")
-            or report_scope.get("textNormalized")
-            or report_scope.get("text")
             or ""
-        ),
+        ).strip(),
     }
+
+
+def _coerce_text_list(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    return [str(item).strip() for item in values if str(item or "").strip()]
 
 
 def _json_payload(payload: dict[str, Any]) -> str:

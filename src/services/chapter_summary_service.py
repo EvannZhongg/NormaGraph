@@ -6,7 +6,7 @@ import json
 import logging
 from typing import Any, Sequence
 
-from adapters.llm_client import ResponseAPIError, ResponsesAPIClient
+from adapters.llm_client import ResponseAPIError, ResponseAPIOutputError, ResponsesAPIClient
 from core.config import AppConfig
 from prompts import LLM_CHAPTER_SUMMARY_SYSTEM_PROMPT, build_chapter_summary_prompt
 
@@ -123,6 +123,13 @@ class ChapterSummaryService:
                 summary = str(payload.get("summary") or "").strip()
                 if not summary:
                     raise ResponseAPIError("Chapter summary response did not include a non-empty summary.")
+            except ResponseAPIOutputError as exc:
+                summary = self._summary_from_plain_text(exc.raw_text)
+                if not summary:
+                    failed_count += 1
+                    warnings.append(f"chapter_summary_failed:{chapter_uid}:{exc}")
+                    continue
+                warnings.append(f"chapter_summary_plain_text_fallback:{chapter_uid}")
             except ResponseAPIError as exc:
                 failed_count += 1
                 warnings.append(f"chapter_summary_failed:{chapter_uid}:{exc}")
@@ -202,6 +209,15 @@ class ChapterSummaryService:
 
     def _sort_clauses(self, clauses: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         return sorted(clauses, key=lambda item: self._clause_sort_key(item.get("clause_ref")))
+
+    def _summary_from_plain_text(self, raw_text: str | None) -> str:
+        summary = str(raw_text or "").strip()
+        if not summary:
+            return ""
+        summary = summary.strip("` \n\r\t")
+        if summary.startswith("json"):
+            summary = summary[4:].strip()
+        return summary[:500].strip()
 
     def _clause_sort_key(self, clause_ref: Any) -> tuple[Any, ...]:
         parts = str(clause_ref or "").split(".")

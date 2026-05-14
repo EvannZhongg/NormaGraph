@@ -44,7 +44,7 @@ llm:
   enabled: true
   provider: "openai_responses"
   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-  model: "qwen3.5-plus"
+  model: "qwen3.6-plus"
   structured_output_mode: "response_format"
   enable_thinking: false
   temperature: 0.0
