@@ -238,6 +238,25 @@ export interface GraphServiceStatus {
   selectedSpace?: KgSpaceDetail | null
 }
 
+export interface QuestionRequest {
+  question: string
+  standardIds: string[]
+  queryMode: 'hybrid' | 'graph' | 'vector'
+  topK: number
+  chunkTopK: number
+  historyTurns: number
+  rerank: boolean
+  userPrompt?: string | null
+  expandCitations: boolean
+}
+
+export interface QuestionResponse {
+  answer: string
+  standardIds: string[]
+  citations: Record<string, unknown>[]
+  graphHops: Record<string, unknown>[]
+}
+
 export interface GraphEntityExistsResponse {
   exists: boolean
   nodeId?: string | null
@@ -383,6 +402,11 @@ export async function fetchGraphServiceStatus(standardId?: string) {
   const response = await api.get<GraphServiceStatus>('/health', {
     params: standardId ? { standard_id: standardId } : undefined,
   })
+  return response.data
+}
+
+export async function askQuestion(payload: QuestionRequest) {
+  const response = await api.post<QuestionResponse>('/v1/qa/ask', payload)
   return response.data
 }
 
