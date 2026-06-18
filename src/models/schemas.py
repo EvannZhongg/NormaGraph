@@ -351,6 +351,12 @@ class RequirementDetail(BaseModel):
 class QuestionRequest(BaseModel):
     question: str
     standardIds: list[str] = Field(default_factory=list)
+    queryMode: Literal["hybrid", "graph", "vector"] = "hybrid"
+    topK: int = Field(default=8, ge=1, le=100)
+    chunkTopK: int = Field(default=12, ge=1, le=100)
+    historyTurns: int = Field(default=4, ge=0, le=20)
+    rerank: bool = True
+    userPrompt: str | None = None
     expandCitations: bool = True
 
 

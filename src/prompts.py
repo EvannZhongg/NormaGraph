@@ -110,6 +110,26 @@ LLM_REPORT_SECTION_SUMMARY_SYSTEM_PROMPT = """你是水利水电工程安全评�
 8. 输出必须严格满足给定 JSON Schema。"""
 
 
+RAG_SCOPE_ROUTING_SYSTEM_PROMPT = """你是水利水电规范知识图谱问答的检索路由器。你的任务是根据用户问题，在给定的 chapter summary 与 section label 中选择最可能相关的范围，用于后续 clause / requirement 向量召回。
+
+要求：
+1. 只能依据输入候选的 ref、title、summary、section labels 判断，不要补写外部知识。
+2. 优先选择能覆盖问题主题的 chapter；如果能进一步定位到 section，则选择对应 section。
+3. 不要为了凑数量选择无关范围；如果问题较泛，可以只选 chapter。
+4. 输出必须严格满足 JSON Schema。"""
+
+
+RAG_ANSWER_SYSTEM_PROMPT = """你是水利水电规范知识图谱问答助手。你只能依据输入的检索上下文回答问题。
+
+要求：
+1. 只能使用检索上下文中的章节路径、条文号、clause 原文、requirement_text、judgement_criteria、evidence_expected 作答。
+2. 不得编造上下文中不存在的事实、数值、条文或外部规范。
+3. 如果问题包含多个并列子问、多个条件或多个条文要求，必须逐项完整回答，不能只答第一部分。
+4. 如果检索上下文已包含对应条文，就直接给出答案，不要因为答案较长或包含多个相关要求而说“上下文不足”。
+5. 回答应使用中文，优先按条文/要求组织，保持简洁。
+6. 引用优先使用 clause_ref；如需要更细粒度引用，系统会在响应层补充 node_uid。"""
+
+
 def build_clause_extraction_prompt(standard_uid: str, clauses: Sequence[dict[str, Any]]) -> str:
     payload = {
         "standard_uid": standard_uid,
@@ -316,6 +336,84 @@ def build_report_section_summary_prompt(
                 "text": unit.get("text_for_summary") or "",
             }
             for unit in units
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def build_rag_scope_routing_prompt(
+    question: str,
+    standard_uid: str,
+    chapters: Sequence[dict[str, Any]],
+    sections: Sequence[dict[str, Any]],
+    *,
+    top_k: int,
+) -> str:
+    sections_by_chapter: dict[str, list[dict[str, Any]]] = {}
+    for section in sections:
+        chapter_id = str(section.get("chapter_id") or "")
+        if chapter_id:
+            sections_by_chapter.setdefault(chapter_id, []).append(section)
+
+    payload = {
+        "standard_uid": standard_uid,
+        "task": "根据用户问题选择相关 chapter / section 粗定位范围。",
+        "question": question,
+        "selection_limits": {
+            "max_chapters": max(1, min(top_k, 8)),
+            "max_sections": max(0, min(top_k * 2, 16)),
+        },
+        "chapters": [
+            {
+                "node_uid": chapter.get("node_uid"),
+                "ref": chapter.get("ref"),
+                "title": chapter.get("title") or chapter.get("label"),
+                "summary": chapter.get("summary") or chapter.get("text_content") or "",
+                "sections": [
+                    {
+                        "node_uid": section.get("node_uid"),
+                        "ref": section.get("ref"),
+                        "title": section.get("title") or section.get("label"),
+                    }
+                    for section in sections_by_chapter.get(str(chapter.get("node_uid") or ""), [])
+                ],
+            }
+            for chapter in chapters
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def build_rag_answer_prompt(
+    question: str,
+    standard_uid: str,
+    retrieval_contexts: Sequence[dict[str, Any]],
+    *,
+    user_prompt: str | None = None,
+) -> str:
+    payload = {
+        "standard_uid": standard_uid,
+        "task": "基于检索上下文回答用户问题，并给出 node_uid / clause_ref 引用。",
+        "question": question,
+        "user_prompt": user_prompt or "",
+        "context_priority": [
+            "chapter_path",
+            "clause_ref",
+            "clause_text",
+            "requirement_text",
+            "judgement_criteria",
+            "evidence_expected",
+        ],
+        "retrieval_contexts": [
+            {
+                "chapter_path": item.get("chapter_path") or [],
+                "clause_ref": item.get("clause_ref"),
+                "clause_text": item.get("clause_text"),
+                "requirement_text": item.get("requirement_text"),
+                "judgement_criteria": item.get("judgement_criteria") or [],
+                "evidence_expected": item.get("evidence_expected") or [],
+            }
+            for item in retrieval_contexts
         ],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)

@@ -329,7 +329,14 @@ def build_router(ingestion_service: IngestionService) -> APIRouter:
 
     @router.post("/v1/qa/ask", response_model=QuestionResponse)
     async def ask_question(request: QuestionRequest) -> QuestionResponse:
-        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=f"QA API is not implemented yet for question: {request.question}")
+        try:
+            return ingestion_service.answer_question(request)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ResponseAPIError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     @router.post("/v1/comparisons", response_model=ComparisonSummary, status_code=status.HTTP_202_ACCEPTED)
     async def create_comparison(request: CreateComparisonRequest) -> ComparisonSummary:

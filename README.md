@@ -226,12 +226,16 @@ normagraph-server
   --standard-id sl258:2017
 ```
 
-对已有 artifact 离线生成报告空间：
+生成1-hop和2-hop的QA：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\run_report_pipeline.py `
-  --artifact-dir data\artifacts\<document_id> `
-  --document-id <document_id>
+python scripts\generate_1hop_qa.py --question-count 200 --candidate-count 300
+python scripts\generate_2hop_qa.py --append --question-count 120 --candidate-count 300 --seed 20260618             
+```
+
+全量评估QA：
+```
+python .\scripts\evaluate_rag_qa.py --top-k 8 --chunk-top-k 10 --retrieval-workers 4 --judge-workers 4 --output data/eval/rag-eval-report.json
 ```
 
 初始化 PostgreSQL / pgvector：
@@ -314,3 +318,8 @@ normagraph-server
 - `fallback_to_heuristic_on_llm_error=true` 可以保证标准建图链路尽量闭环，但质量不等价于稳定 LLM 抽取。
 - 报告对比依赖规范图谱、报告空间和 LLM 路由质量；存在 failed units 时，coverage 不应视为最终结论。
 - 当 `embedding.enabled=true` 或 `postgres.enabled=true` 时，需要确保对应服务、密钥和权限可用。
+
+- （日志后续要更新为中文，加进度显示）
+- （报告对规范图谱的覆盖率计算）
+- （图rag）
+- 移除“本地默认值计算最终 requirements.json 里的内部置信度”

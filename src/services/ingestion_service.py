@@ -39,6 +39,7 @@ from repositories.standard_registry import StandardRegistry
 from services.normalization import NormalizationService
 from services.report_comparison_agent import ReportComparisonAgentService
 from services.report_pipeline import ReportPipelineService
+from services.retrieval_qa_service import RetrievalQAService
 from services.standard_pipeline import StandardPipelineService
 
 
@@ -74,6 +75,7 @@ class IngestionService:
         self.standard_pipeline_service = standard_pipeline_service
         self.report_pipeline_service = report_pipeline_service
         self.report_comparison_agent = ReportComparisonAgentService(config, ResponsesAPIClient(config))
+        self.retrieval_qa_service = RetrievalQAService(config)
 
     def create_job(self, request: CreateIngestionJobRequest, background_tasks: BackgroundTasks) -> IngestionJob:
         source_path = self._resolve_source_path(request.sourcePath)
@@ -162,6 +164,9 @@ class IngestionService:
                 for item in report_units
             ],
         }
+
+    def answer_question(self, request: "QuestionRequest") -> "QuestionResponse":
+        return self.retrieval_qa_service.answer(request)
 
     def get_report_comparison_detail(self, document_id: str, standard_id: str) -> dict[str, Any]:
         payload = self._load_report_comparison(document_id, standard_id)

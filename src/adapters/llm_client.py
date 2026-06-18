@@ -43,10 +43,27 @@ class ResponsesAPIClient:
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self.reset_stats()
 
     @property
     def enabled(self) -> bool:
         return self.config.llm.enabled and bool(self.config.llm.api_key)
+
+    def reset_stats(self) -> None:
+        self._request_count = 0
+        self._input_tokens = 0
+        self._output_tokens = 0
+        self._total_tokens = 0
+        self._last_usage: dict[str, int] | None = None
+
+    def snapshot_stats(self) -> dict[str, Any]:
+        return {
+            "request_count": self._request_count,
+            "input_tokens": self._input_tokens,
+            "output_tokens": self._output_tokens,
+            "total_tokens": self._total_tokens,
+            "last_usage": self._last_usage,
+        }
 
     def create_structured_output(
         self,
@@ -150,8 +167,39 @@ class ResponsesAPIClient:
             data = response.json()
         except ValueError as exc:
             raise ResponseAPIRequestError("Responses API did not return valid JSON.") from exc
+        self._record_usage(data.get("usage"))
         self._raise_for_response_status(data)
         return data
+
+    def _record_usage(self, raw_usage: Any) -> None:
+        self._request_count += 1
+        if not isinstance(raw_usage, dict):
+            self._last_usage = None
+            return
+        input_tokens = self._usage_int(raw_usage, "input_tokens", "prompt_tokens")
+        output_tokens = self._usage_int(raw_usage, "output_tokens", "completion_tokens")
+        total_tokens = self._usage_int(raw_usage, "total_tokens")
+        if total_tokens == 0 and (input_tokens or output_tokens):
+            total_tokens = input_tokens + output_tokens
+        usage = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        }
+        self._input_tokens += input_tokens
+        self._output_tokens += output_tokens
+        self._total_tokens += total_tokens
+        self._last_usage = usage
+
+    @staticmethod
+    def _usage_int(raw_usage: dict[str, Any], *keys: str) -> int:
+        for key in keys:
+            value = raw_usage.get(key)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+        return 0
 
     def _build_structured_output_payload(self, *, schema_name: str, schema: dict[str, Any]) -> dict[str, Any]:
         mode = self._structured_output_mode()
@@ -356,13 +404,19 @@ class EmbeddingsAPIClient:
         self._request_attempt_count = 0
         self._retry_attempt_count = 0
         self._retried_call_count = 0
+        self._input_tokens = 0
+        self._total_tokens = 0
+        self._last_usage: dict[str, int] | None = None
 
-    def snapshot_stats(self) -> dict[str, int]:
+    def snapshot_stats(self) -> dict[str, Any]:
         return {
             'call_count': self._call_count,
             'request_attempt_count': self._request_attempt_count,
             'retry_attempt_count': self._retry_attempt_count,
             'retried_call_count': self._retried_call_count,
+            'input_tokens': self._input_tokens,
+            'total_tokens': self._total_tokens,
+            'last_usage': self._last_usage,
         }
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
@@ -395,6 +449,7 @@ class EmbeddingsAPIClient:
                     response = client.post(url, headers=headers, json=payload)
                 response.raise_for_status()
                 data = response.json()
+                self._record_usage(data.get("usage"))
                 rows = data.get("data") or []
                 return [row.get("embedding", []) for row in rows]
             except httpx.HTTPError as exc:
@@ -415,6 +470,22 @@ class EmbeddingsAPIClient:
                 time.sleep(delay_seconds)
 
         raise ResponseAPIError(str(last_exc)) from last_exc
+
+    def _record_usage(self, raw_usage: Any) -> None:
+        if not isinstance(raw_usage, dict):
+            self._last_usage = None
+            return
+        input_tokens = ResponsesAPIClient._usage_int(raw_usage, "input_tokens", "prompt_tokens")
+        total_tokens = ResponsesAPIClient._usage_int(raw_usage, "total_tokens")
+        if total_tokens == 0:
+            total_tokens = input_tokens
+        usage = {
+            "input_tokens": input_tokens,
+            "total_tokens": total_tokens,
+        }
+        self._input_tokens += input_tokens
+        self._total_tokens += total_tokens
+        self._last_usage = usage
 
     def _retry_delay_seconds(self, attempt_number: int) -> float:
         base_delay = max(0.0, self.config.embedding.retry_backoff_seconds)
