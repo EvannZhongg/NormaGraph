@@ -47,9 +47,10 @@ export function RetrievalPage() {
   const scrollRef = useRef<HTMLDivElement | null>(null)
 
   const selectedSpace = useMemo(
-    () => kgSpaces.find((item) => item.standardId === selectedStandardId) ?? kgSpaces[0] ?? null,
+    () => kgSpaces.find((item) => item.standardId === selectedStandardId) ?? null,
     [kgSpaces, selectedStandardId],
   )
+  const isGlobalSearch = !selectedStandardId
 
   useEffect(() => {
     void loadSpaces()
@@ -58,12 +59,6 @@ export function RetrievalPage() {
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
   }, [messages])
-
-  useEffect(() => {
-    if (!selectedStandardId && kgSpaces.length > 0) {
-      setSelectedStandardId(kgSpaces[0].standardId)
-    }
-  }, [kgSpaces, selectedStandardId, setSelectedStandardId])
 
   async function loadSpaces() {
     setIsLoadingSpaces(true)
@@ -100,7 +95,7 @@ export function RetrievalPage() {
     try {
       const response = await askQuestion({
         question: trimmedQuestion,
-        standardIds: activeStandardId ? [activeStandardId] : [],
+        standardIds: isGlobalSearch || !activeStandardId ? [] : [activeStandardId],
         queryMode: retrieval.queryMode,
         topK: clampNumber(retrieval.topK, 1, 100),
         chunkTopK: clampNumber(retrieval.chunkTopK, 1, 100),
@@ -156,7 +151,7 @@ export function RetrievalPage() {
               className="control-textarea min-h-[112px]"
               value={question}
               onChange={(event) => setQuestion(event.target.value)}
-              placeholder="输入要面向当前 kg-space 提问的问题"
+              placeholder={isGlobalSearch ? '输入问题，系统会自动选择相关 KG spaces' : '输入要面向当前 KG space 提问的问题'}
               disabled={isAsking}
             />
             <div className="flex flex-wrap items-center justify-end gap-3">
@@ -189,25 +184,45 @@ export function RetrievalPage() {
             {isLoadingSpaces ? <InlineNotice text="正在读取 data/kg_spaces 产物..." /> : null}
 
             <div className="grid gap-2">
-              {kgSpaces.map((space) => (
-                <button
-                  key={space.standardId}
-                  type="button"
-                  onClick={() => setSelectedStandardId(space.standardId)}
-                  className={`kg-space-option ${space.standardId === selectedSpace?.standardId ? 'is-active' : ''}`}
-                >
+              <select
+                value={selectedStandardId ?? '__global__'}
+                onChange={(event) => setSelectedStandardId(event.target.value === '__global__' ? null : event.target.value)}
+                className="control-select"
+                disabled={isLoadingSpaces}
+              >
+                <option value="__global__">全局检索（自动选择 KG spaces）</option>
+                {kgSpaces.map((space) => (
+                  <option key={space.standardId} value={space.standardId}>
+                    {space.standardId} · {space.title}
+                  </option>
+                ))}
+              </select>
+              {isGlobalSearch ? (
+                <div className="kg-space-option is-active">
                   <span className="flex min-w-0 items-center justify-between gap-2">
-                    <strong className="truncate">{space.standardId}</strong>
+                    <strong className="truncate">全局检索</strong>
                     <span className="status-dot text-emerald-500" />
                   </span>
-                  <span className="truncate">{space.title}</span>
+                  <span className="truncate">先路由到相关 KG spaces，再进入章节和条款检索。</span>
                   <span className="flex flex-wrap gap-2">
-                    <small>{space.nodeCount} nodes</small>
-                    <small>{space.edgeCount} edges</small>
-                    <small>{space.requirementCount} reqs</small>
+                    <small>{kgSpaces.length} spaces</small>
+                    <small>auto route</small>
                   </span>
-                </button>
-              ))}
+                </div>
+              ) : selectedSpace ? (
+                <div className="kg-space-option is-active">
+                  <span className="flex min-w-0 items-center justify-between gap-2">
+                    <strong className="truncate">{selectedSpace.standardId}</strong>
+                    <span className="status-dot text-emerald-500" />
+                  </span>
+                  <span className="truncate">{selectedSpace.title}</span>
+                  <span className="flex flex-wrap gap-2">
+                    <small>{selectedSpace.nodeCount} nodes</small>
+                    <small>{selectedSpace.edgeCount} edges</small>
+                    <small>{selectedSpace.requirementCount} reqs</small>
+                  </span>
+                </div>
+              ) : null}
               {!isLoadingSpaces && kgSpaces.length === 0 ? <InlineNotice text="未发现可用 kg-space。" /> : null}
             </div>
           </div>
