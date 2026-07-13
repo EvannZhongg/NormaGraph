@@ -10,8 +10,9 @@ import logging
 import re
 from typing import Any
 
-from adapters.llm_client import EmbeddingsAPIClient, ResponsesAPIClient
+from adapters.llm_client import EmbeddingsAPIClient, ResponseAPIError, ResponsesAPIClient
 from core.config import AppConfig, get_config
+from prompts import LLM_KG_SPACE_PROFILE_SYSTEM_PROMPT, build_kg_space_profile_prompt
 from repositories.postgres_graph_store import PostgresGraphStore
 from services.chapter_summary_service import ChapterSummaryService
 from services.graph_materialization import GraphMaterializationService
@@ -20,6 +21,19 @@ from services.standard_outline_planner import StandardOutlinePlannerService
 
 
 logger = logging.getLogger(__name__)
+
+KG_SPACE_PROFILE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "scope_summary": {"type": "string"},
+        "keywords": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["scope_summary", "keywords"],
+}
 
 CHINESE_SPACED_RE = re.compile(r'(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])')
 MULTI_SPACE_RE = re.compile(r'\s+')
@@ -59,6 +73,7 @@ class PipelineOutput:
     structure_nodes: list[dict[str, Any]]
     clauses: list[dict[str, Any]]
     requirements: list[dict[str, Any]]
+    kg_space_profile: dict[str, Any] = field(default_factory=dict)
     graph_nodes: list[dict[str, Any]] = field(default_factory=list)
     graph_edges: list[dict[str, Any]] = field(default_factory=list)
     embedding_documents: list[dict[str, Any]] = field(default_factory=list)
@@ -81,6 +96,7 @@ class StandardPipelineService:
     ) -> None:
         self.config = config or get_config()
         llm_client = ResponsesAPIClient(self.config)
+        self.llm_client = llm_client
         self.llm_extraction_service = llm_extraction_service or LLMGraphExtractionService(self.config, llm_client)
         self.chapter_summary_service = chapter_summary_service or ChapterSummaryService(self.config, llm_client)
         self.outline_planner = outline_planner or StandardOutlinePlannerService(self.config, llm_client)
@@ -115,9 +131,12 @@ class StandardPipelineService:
             metrics['title_plan_warnings'] = title_plan_warnings
         requirements, extraction_metrics, extraction_warnings = self._extract_requirements(clauses, standard_uid)
         chapter_summary_metrics, chapter_summary_warnings = self._generate_chapter_summaries(structure_nodes, clauses, standard_uid)
+        kg_space_profile = self._build_kg_space_profile(structure_nodes, standard_uid)
         extraction_warnings = [*title_plan_warnings, *structure_warnings, *extraction_warnings, *chapter_summary_warnings]
         metrics.update(extraction_metrics)
         metrics.update(chapter_summary_metrics)
+        metrics['kg_space_profile_status'] = kg_space_profile.get('status') or 'completed'
+        metrics['kg_space_profile_chapter_count'] = len(kg_space_profile.get('chapters') or [])
         metrics['requirement_count'] = len(requirements)
         metrics['clauses_with_requirements'] = sum(1 for clause in clauses if clause.get('requirement_count', 0) > 0)
 
@@ -135,6 +154,8 @@ class StandardPipelineService:
             graph_nodes = graph_result.nodes
             graph_edges = graph_result.edges
             embedding_documents = graph_result.embedding_documents
+            embedding_documents.extend(self._build_kg_scope_embedding_documents(kg_space_profile, standard_uid))
+            embedding_documents.extend(self._build_chapter_summary_embedding_documents(structure_nodes, standard_uid))
             metrics['graph_node_count'] = len(graph_nodes)
             metrics['graph_edge_count'] = len(graph_edges)
             metrics['embedding_document_count'] = len(embedding_documents)
@@ -153,6 +174,7 @@ class StandardPipelineService:
             structure_nodes=structure_nodes,
             clauses=clauses,
             requirements=requirements,
+            kg_space_profile=kg_space_profile,
             graph_nodes=graph_nodes,
             graph_edges=graph_edges,
             embedding_documents=embedding_documents,
@@ -189,6 +211,7 @@ class StandardPipelineService:
             'normalized_structure': graph_space_dir / 'normalized_structure.json',
             'clauses': graph_space_dir / 'clauses.json',
             'requirements': graph_space_dir / 'requirements.json',
+            'kg_space_profile': graph_space_dir / 'kg_space_profile.json',
             'graph_nodes': graph_space_dir / 'graph_nodes.json',
             'graph_edges': graph_space_dir / 'graph_edges.json',
             'embedding_inputs': graph_space_dir / 'embedding_inputs.jsonl',
@@ -211,6 +234,7 @@ class StandardPipelineService:
         files['normalized_structure'].write_text(json.dumps({'nodes': output.structure_nodes}, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         files['clauses'].write_text(json.dumps(output.clauses, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         files['requirements'].write_text(json.dumps(output.requirements, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        files['kg_space_profile'].write_text(json.dumps(output.kg_space_profile, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         files['graph_nodes'].write_text(json.dumps(output.graph_nodes, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         files['graph_edges'].write_text(json.dumps(output.graph_edges, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         lines = [json.dumps(item, ensure_ascii=False) for item in output.embedding_documents]
@@ -260,6 +284,128 @@ class StandardPipelineService:
             )
         return records
 
+    def _build_kg_space_profile(self, structure_nodes: list[dict[str, Any]], standard_uid: str) -> dict[str, Any]:
+        chapters = [
+            {
+                'node_uid': node.get('node_uid'),
+                'ref': node.get('ref'),
+                'title': node.get('title'),
+                'summary': node.get('summary') or '',
+                'summary_source_clause_count': node.get('summary_source_clause_count', 0),
+                'summary_source_truncated': bool(node.get('summary_source_truncated')),
+            }
+            for node in structure_nodes
+            if node.get('node_type') == 'chapter'
+        ]
+        scope_parts = []
+        for chapter in chapters:
+            heading = ' '.join(str(part).strip() for part in [chapter.get('ref'), chapter.get('title')] if str(part or '').strip())
+            summary = str(chapter.get('summary') or '').strip()
+            if summary:
+                scope_parts.append(f'{heading}：{summary}' if heading else summary)
+            elif heading:
+                scope_parts.append(heading)
+        scope_summary = self._normalize_text('；'.join(scope_parts))
+        if len(scope_summary) > 1400:
+            scope_summary = scope_summary[:1400].rstrip() + '...'
+        keywords = self._extract_kg_space_keywords(chapters, scope_summary)
+        status = 'completed' if scope_summary else 'empty'
+        summary_source = 'local'
+
+        prompt_chapters = [chapter for chapter in chapters if str(chapter.get('summary') or '').strip()]
+        if self.llm_client.enabled and prompt_chapters:
+            try:
+                payload = self.llm_client.create_structured_output(
+                    system_prompt=LLM_KG_SPACE_PROFILE_SYSTEM_PROMPT,
+                    user_prompt=build_kg_space_profile_prompt(standard_uid, prompt_chapters),
+                    schema_name='kg_space_profile',
+                    schema=KG_SPACE_PROFILE_SCHEMA,
+                )
+                llm_scope_summary = self._normalize_text(str(payload.get('scope_summary') or ''))
+                if llm_scope_summary:
+                    scope_summary = llm_scope_summary
+                    keywords = self._dedupe_strings(payload.get('keywords') or keywords)[:24]
+                    status = 'completed'
+                    summary_source = 'llm'
+            except ResponseAPIError as exc:
+                logger.warning('KG space profile generation failed for %s; using local fallback: %s', standard_uid, exc)
+
+        return {
+            'profile_uid': f'{standard_uid}:scope_summary',
+            'standard_id': standard_uid,
+            'status': status,
+            'summary_source': summary_source,
+            'scope_summary': scope_summary,
+            'keywords': keywords,
+            'chapters': chapters,
+            'generated_at': datetime.now(UTC).isoformat(),
+        }
+
+    def _build_kg_scope_embedding_documents(self, profile: dict[str, Any], standard_uid: str) -> list[dict[str, Any]]:
+        scope_summary = str(profile.get('scope_summary') or '').strip()
+        if not scope_summary:
+            return []
+        return [
+            {
+                'node_uid': profile.get('profile_uid') or f'{standard_uid}:scope_summary',
+                'standard_uid': standard_uid,
+                'node_type': 'kg_scope_summary',
+                'text': scope_summary,
+            }
+        ]
+
+    def _build_chapter_summary_embedding_documents(
+        self,
+        structure_nodes: list[dict[str, Any]],
+        standard_uid: str,
+    ) -> list[dict[str, Any]]:
+        documents: list[dict[str, Any]] = []
+        for node in structure_nodes:
+            if node.get('node_type') != 'chapter':
+                continue
+            node_uid = str(node.get('node_uid') or '').strip()
+            summary = str(node.get('summary') or '').strip()
+            if not node_uid or not summary:
+                continue
+            heading = ' '.join(
+                str(part).strip()
+                for part in [node.get('ref'), node.get('title')]
+                if str(part or '').strip()
+            )
+            text = '\n'.join(part for part in [heading, summary] if part).strip()
+            documents.append(
+                {
+                    'node_uid': f'{node_uid}#summary',
+                    'source_node_uid': node_uid,
+                    'standard_uid': standard_uid,
+                    'node_type': 'chapter_summary',
+                    'text': text,
+                }
+            )
+        return documents
+
+    def _extract_kg_space_keywords(self, chapters: list[dict[str, Any]], scope_summary: str) -> list[str]:
+        values = [chapter.get('title') for chapter in chapters]
+        for keyword in [
+            '大坝',
+            '水库',
+            '安全鉴定',
+            '基础资料',
+            '现场检查',
+            '安全检测',
+            '监测',
+            '防洪',
+            '渗流',
+            '结构安全',
+            '抗震',
+            '金属结构',
+            '运行管理',
+            '评价报告',
+        ]:
+            if keyword in scope_summary:
+                values.append(keyword)
+        return self._dedupe_strings(values)[:24]
+
     def _flatten_content_list(self, pages: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
         blocks: list[dict[str, Any]] = []
         for page_idx, page in enumerate(pages, start=1):
@@ -267,7 +413,7 @@ class StandardPipelineService:
                 block_type = item.get('type', 'unknown')
                 bbox = item.get('bbox') or []
                 if block_type == 'title':
-                    text = self._join_text_fragments(item.get('content', {}).get('title_content', []))
+                    text = self._join_rich_fragments(item.get('content', {}).get('title_content', []))
                     blocks.append(
                         self._make_block(
                             page_idx,
@@ -281,17 +427,21 @@ class StandardPipelineService:
                         )
                     )
                 elif block_type == 'paragraph':
-                    text = self._join_text_fragments(item.get('content', {}).get('paragraph_content', []))
+                    text = self._join_rich_fragments(item.get('content', {}).get('paragraph_content', []))
                     blocks.append(self._make_block(page_idx, block_idx, None, 'paragraph', text, bbox, item))
                 elif block_type == 'list':
                     for item_idx, list_item in enumerate(item.get('content', {}).get('list_items', []), start=1):
-                        text = self._join_text_fragments(list_item.get('item_content', []))
+                        text = self._join_rich_fragments(list_item.get('item_content', []))
                         blocks.append(self._make_block(page_idx, block_idx, item_idx, 'list_item', text, bbox, item))
                 elif block_type == 'table':
                     table_payload = self._table_to_payload(item.get('content', {}))
                     text = table_payload.get('text', '')
                     if text:
                         blocks.append(self._make_block(page_idx, block_idx, None, 'table', text, bbox, item, extra=table_payload))
+                elif block_type in {'equation', 'equation_interline', 'interline_equation'}:
+                    text = self._join_rich_fragments(item.get('content', {}))
+                    if text:
+                        blocks.append(self._make_block(page_idx, block_idx, None, 'equation', text, bbox, item))
         return blocks
 
     def _build_structure(
@@ -465,10 +615,10 @@ class StandardPipelineService:
                     }
                 )
                 metrics['table_count'] += 1
-                caption_text = block.get('table_caption')
-                if caption_text:
-                    current_clause['_text_parts'].append(caption_text)
-                    current_clause['_normalized_parts'].append(self._normalize_text(caption_text))
+                table_text = block.get('text') or block.get('table_html') or block.get('table_caption')
+                if table_text:
+                    current_clause['_text_parts'].append(table_text)
+                    current_clause['_normalized_parts'].append(self._normalize_text(table_text))
                 current_clause['notes'].append('table_block')
                 continue
             list_match = LIST_ITEM_RE.match(block['text_normalized'])
@@ -807,7 +957,7 @@ class StandardPipelineService:
         return block
 
     def _join_text_fragments(self, fragments: list[dict[str, Any]]) -> str:
-        return ''.join(fragment.get('content', '') for fragment in fragments if fragment.get('type') == 'text').strip()
+        return self._join_rich_fragments(fragments)
 
     def _normalize_text(self, text: str) -> str:
         normalized = text.replace('\u3000', ' ')
@@ -869,6 +1019,16 @@ class StandardPipelineService:
 
     def _join_rich_fragments(self, fragments: Any, *, separator: str = '') -> str:
         if isinstance(fragments, dict):
+            fragment_type = str(fragments.get('type') or '').strip().lower()
+            if fragment_type in {'equation_inline', 'inline_equation'}:
+                return self._wrap_inline_math(fragments.get('math_content') or fragments.get('content'))
+            if fragment_type in {'equation_interline', 'interline_equation', 'equation'}:
+                return self._wrap_display_math(fragments.get('math_content') or fragments.get('content'))
+            if fragments.get('math_content'):
+                return self._wrap_display_math(fragments.get('math_content'))
+            for key in ('text', 'latex'):
+                if fragments.get(key):
+                    return str(fragments.get(key) or '').strip()
             return self._join_rich_fragments(fragments.get('content'), separator=separator)
         if isinstance(fragments, list):
             parts = [self._join_rich_fragments(item, separator='') for item in fragments]
@@ -876,6 +1036,18 @@ class StandardPipelineService:
         if fragments is None:
             return ''
         return str(fragments).strip()
+
+    def _wrap_inline_math(self, value: Any) -> str:
+        text = str(value or '').strip()
+        if not text:
+            return ''
+        return f'\\({text}\\)'
+
+    def _wrap_display_math(self, value: Any) -> str:
+        text = str(value or '').strip()
+        if not text:
+            return ''
+        return f'\\[{text}\\]'
 
     def _extract_table_ref(self, text: str) -> str | None:
         if not text:

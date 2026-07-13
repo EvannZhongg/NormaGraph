@@ -198,9 +198,17 @@ class RetrievalQAService:
             )
 
         scored.sort(key=lambda item: item["score"], reverse=True)
-        selected_records = [item["record"] for item in scored[: max(1, chunk_top_k)]]
-        contexts = [self._build_context(space, record) for record in selected_records]
-        citations = [self._build_citation(space, record) for record in selected_records]
+        selected_items = scored[: max(1, chunk_top_k)]
+        contexts = []
+        citations = []
+        for item in selected_items:
+            record = item["record"]
+            context = self._build_context(space, record)
+            context["score"] = item["score"]
+            citation = self._build_citation(space, record)
+            citation["score"] = item["score"]
+            contexts.append(context)
+            citations.append(citation)
         return {"contexts": contexts, "citations": citations}
 
     def _build_context(self, space: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
@@ -211,7 +219,10 @@ class RetrievalQAService:
         clause = space["clauses_by_uid"].get(clause_uid) or {}
         clause_meta = space["clause_meta"].get(clause_uid) or {}
         return {
+            "standard_uid": space["standard_id"],
+            "node_uid": node_uid,
             "node_type": node_type,
+            "clause_uid": clause_uid,
             "chapter_path": clause_meta.get("chapter_path") or clause.get("heading_path") or [],
             "clause_ref": clause.get("clause_ref") or (requirement or {}).get("clause_ref"),
             "clause_text": clause.get("source_text_normalized") or clause.get("source_text") or record.get("text") or "",
@@ -257,6 +268,7 @@ class RetrievalQAService:
             "standard_id": self._manifest_standard_id(space_dir, standard_id),
             "space_dir": space_dir,
             "node_map": node_map,
+            "edges": edges,
             "chapters": self._list_scope_nodes(node_map, "chapter"),
             "sections": self._list_scope_nodes(node_map, "section", parent_by_id=parent_by_id),
             "chapter_ids": {uid for uid, node in node_map.items() if node.get("node_type") == "chapter"},
@@ -426,7 +438,9 @@ class RetrievalQAService:
         clause_uid = str((requirement or {}).get("parent_clause_uid") or node_uid)
         clause = space["clauses_by_uid"].get(clause_uid) or {}
         return {
+            "standard_id": space["standard_id"],
             "node_uid": node_uid,
+            "node_type": node_type,
             "clause_ref": clause.get("clause_ref") or (requirement or {}).get("clause_ref"),
             "clause_uid": clause_uid,
         }

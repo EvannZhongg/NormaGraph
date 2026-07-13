@@ -7,11 +7,13 @@ from html import unescape
 from pathlib import Path
 import hashlib
 import json
+import logging
 import re
 from typing import Any
 
-from adapters.llm_client import ResponsesAPIClient
+from adapters.llm_client import EmbeddingsAPIClient, ResponseAPIError, ResponsesAPIClient
 from core.config import AppConfig, get_config
+from prompts import LLM_REPORT_SCOPE_SUMMARY_SYSTEM_PROMPT, build_report_scope_summary_prompt
 from services.report_outline_planner import ReportOutlinePlannerService
 from services.report_section_summary_service import ReportSectionSummaryService
 
@@ -28,6 +30,21 @@ FIGURE_REF_RE = re.compile(r'(?P<label>图|照片|附图)\s*(?P<ref>[A-Za-z0-9+\
 
 TEXTUAL_BLOCK_TYPES = {'paragraph', 'equation'}
 
+logger = logging.getLogger(__name__)
+
+REPORT_SCOPE_SUMMARY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "scope_summary": {"type": "string"},
+        "keywords": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["scope_summary", "keywords"],
+}
+
 
 @dataclass
 class ReportPipelineOutput:
@@ -38,9 +55,11 @@ class ReportPipelineOutput:
     report_units: list[dict[str, Any]]
     tables: list[dict[str, Any]]
     figures: list[dict[str, Any]]
+    scope_summary: dict[str, Any] = field(default_factory=dict)
     report_nodes: list[dict[str, Any]] = field(default_factory=list)
     report_edges: list[dict[str, Any]] = field(default_factory=list)
     embedding_documents: list[dict[str, Any]] = field(default_factory=list)
+    embedding_vectors: dict[str, list[float]] = field(default_factory=dict)
     metrics: dict[str, Any] = field(default_factory=dict)
     report_markdown: str = ''
 
@@ -51,9 +70,11 @@ class ReportPipelineService:
         config: AppConfig | None = None,
         outline_planner: ReportOutlinePlannerService | None = None,
         section_summary_service: ReportSectionSummaryService | None = None,
+        embedding_client: EmbeddingsAPIClient | None = None,
     ) -> None:
         self.config = config or get_config()
         llm_client = ResponsesAPIClient(self.config)
+        self.llm_client = llm_client
         self.outline_planner = outline_planner or ReportOutlinePlannerService(
             self.config,
             llm_client,
@@ -62,6 +83,7 @@ class ReportPipelineService:
             self.config,
             llm_client,
         )
+        self.embedding_client = embedding_client or EmbeddingsAPIClient(self.config)
 
     def run(self, artifact_dir: Path, document_id: str) -> ReportPipelineOutput:
         content_list_path = self._resolve_content_list_path(artifact_dir)
@@ -97,8 +119,16 @@ class ReportPipelineService:
         metrics['report_section_summary_warning_count'] = len(section_summary_warnings)
         if section_summary_warnings:
             metrics['report_section_summary_warnings'] = section_summary_warnings
+        scope_summary = self._build_scope_summary(
+            document_id=document_id,
+            sections=sections,
+            report_units=report_units,
+        )
+        metrics['scope_summary_status'] = scope_summary.get('status') or 'completed'
+        metrics['scope_summary_section_count'] = len(scope_summary.get('sections') or [])
         report_nodes, report_edges, embedding_documents = self._materialize_report_graph(
             document_id=document_id,
+            scope_summary=scope_summary,
             sections=sections,
             report_units=report_units,
             tables=tables,
@@ -107,10 +137,12 @@ class ReportPipelineService:
         metrics['report_node_count'] = len(report_nodes)
         metrics['report_edge_count'] = len(report_edges)
         metrics['embedding_document_count'] = len(embedding_documents)
+        embedding_vectors = self._generate_embeddings(embedding_documents, metrics)
         report_markdown = self._build_report(
             artifact_dir=artifact_dir,
             document_id=document_id,
             metrics=metrics,
+            scope_summary=scope_summary,
             sections=sections,
             report_units=report_units,
             tables=tables,
@@ -124,9 +156,11 @@ class ReportPipelineService:
             report_units=report_units,
             tables=tables,
             figures=figures,
+            scope_summary=scope_summary,
             report_nodes=report_nodes,
             report_edges=report_edges,
             embedding_documents=embedding_documents,
+            embedding_vectors=embedding_vectors,
             metrics=metrics,
             report_markdown=report_markdown,
         )
@@ -159,9 +193,11 @@ class ReportPipelineService:
             'report_units': report_space_dir / 'report_units.json',
             'tables': report_space_dir / 'tables.json',
             'figures': report_space_dir / 'figures.json',
+            'scope_summary': report_space_dir / 'scope_summary.json',
             'report_nodes': report_space_dir / 'report_nodes.json',
             'report_edges': report_space_dir / 'report_edges.json',
             'embedding_inputs': report_space_dir / 'embedding_inputs.jsonl',
+            'embedding_store': report_space_dir / 'embedding_store.jsonl',
             'metrics': report_space_dir / 'segmentation_metrics.json',
             'report': report_space_dir / 'segmentation_report.md',
         }
@@ -172,6 +208,7 @@ class ReportPipelineService:
             'report_space_dir': str(report_space_dir),
             'source_path': str(source_path) if source_path else None,
             'generated_at': datetime.now(UTC).isoformat(),
+            'scope_summary_uid': output.scope_summary.get('scope_summary_uid'),
         }
         files['manifest'].write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         files['normalized_blocks'].write_text(json.dumps(output.normalized_blocks, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
@@ -181,10 +218,20 @@ class ReportPipelineService:
         files['report_units'].write_text(json.dumps(output.report_units, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         files['tables'].write_text(json.dumps(output.tables, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         files['figures'].write_text(json.dumps(output.figures, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        files['scope_summary'].write_text(json.dumps(output.scope_summary, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         files['report_nodes'].write_text(json.dumps(output.report_nodes, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         files['report_edges'].write_text(json.dumps(output.report_edges, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         lines = [json.dumps(item, ensure_ascii=False) for item in output.embedding_documents]
         files['embedding_inputs'].write_text(('\n'.join(lines) + ('\n' if lines else '')), encoding='utf-8')
+        embedding_store_records = self._build_local_embedding_store_records(output.embedding_documents, output.embedding_vectors)
+        if embedding_store_records:
+            store_lines = [json.dumps(item, ensure_ascii=False) for item in embedding_store_records]
+            files['embedding_store'].write_text(('\n'.join(store_lines) + '\n'), encoding='utf-8')
+            output.metrics['local_embedding_store_status'] = 'completed'
+            output.metrics['local_embedding_store_record_count'] = len(embedding_store_records)
+        else:
+            output.metrics['local_embedding_store_status'] = 'skipped_no_vectors'
+            files.pop('embedding_store')
         files['metrics'].write_text(json.dumps(output.metrics, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         files['report'].write_text(output.report_markdown, encoding='utf-8')
         return files
@@ -196,7 +243,7 @@ class ReportPipelineService:
                 block_type = item.get('type', 'unknown')
                 bbox = item.get('bbox') or []
                 if block_type == 'title':
-                    text = self._join_text_fragments(item.get('content', {}).get('title_content', []))
+                    text = self._join_rich_fragments(item.get('content', {}).get('title_content', []))
                     if text:
                         blocks.append(
                             self._make_block(
@@ -657,10 +704,136 @@ class ReportPipelineService:
             section['summary_source_truncated'] = bool(item.get('summary_source_truncated'))
         return result.metrics, result.warnings
 
+    def _build_scope_summary(
+        self,
+        *,
+        document_id: str,
+        sections: list[dict[str, Any]],
+        report_units: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        summary_sections: list[dict[str, Any]] = []
+        for section in sorted(sections, key=lambda item: (int(item.get('order_index') or 0), str(item.get('section_uid') or ''))):
+            if section.get('section_kind') == 'toc':
+                continue
+            section_uid = str(section.get('section_uid') or '').strip()
+            title = str(section.get('title') or '').strip()
+            summary = str(section.get('summary_overall') or section.get('summary') or section.get('content_preview') or '').strip()
+            if not section_uid or not title:
+                continue
+            summary_sections.append(
+                {
+                    'section_uid': section_uid,
+                    'title': title,
+                    'section_kind': section.get('section_kind'),
+                    'path': section.get('path') or [],
+                    'structural_path': section.get('structural_path') or [],
+                    'summary': summary,
+                    'member_count': int(section.get('member_count') or 0),
+                    'page_span': section.get('page_span') or [],
+                }
+            )
+
+        title_path = [item['title'] for item in summary_sections if item.get('section_kind') == 'chapter'][:12]
+        if not title_path:
+            title_path = [item['title'] for item in summary_sections[:12]]
+        summary_parts = []
+        for item in summary_sections[:12]:
+            summary = item.get('summary') or ''
+            if summary:
+                summary_parts.append(f"{item['title']}：{summary}")
+            else:
+                summary_parts.append(str(item['title']))
+        scope_text = '；'.join(summary_parts)
+        if not scope_text:
+            previews = [
+                str(unit.get('text_normalized') or unit.get('text') or '').strip()
+                for unit in sorted(report_units, key=lambda item: (int(item.get('order_index') or 0), str(item.get('unit_uid') or '')))[:12]
+            ]
+            scope_text = '；'.join(value[:160] for value in previews if value)
+        scope_text = self._normalize_text(scope_text)
+        if len(scope_text) > 1200:
+            scope_text = scope_text[:1200].rstrip() + '...'
+        keywords = self._extract_scope_keywords(summary_sections, scope_text)
+        status = 'completed' if scope_text else 'empty'
+        summary_source = 'local'
+
+        if self.llm_client.enabled and summary_sections:
+            try:
+                payload = self.llm_client.create_structured_output(
+                    system_prompt=LLM_REPORT_SCOPE_SUMMARY_SYSTEM_PROMPT,
+                    user_prompt=build_report_scope_summary_prompt(document_id, summary_sections, report_units),
+                    schema_name='report_scope_summary',
+                    schema=REPORT_SCOPE_SUMMARY_SCHEMA,
+                )
+                llm_scope_text = self._normalize_text(str(payload.get('scope_summary') or ''))
+                if llm_scope_text:
+                    scope_text = llm_scope_text
+                    keywords = self._dedupe_scope_keywords(payload.get('keywords') or keywords)
+                    status = 'completed'
+                    summary_source = 'llm'
+            except ResponseAPIError as exc:
+                logger.warning('Report scope summary generation failed for %s; using local fallback: %s', document_id, exc)
+
+        return {
+            'scope_summary_uid': f'report:{document_id}:scope_summary',
+            'document_id': document_id,
+            'status': status,
+            'summary_source': summary_source,
+            'summary': scope_text,
+            'keywords': keywords,
+            'section_titles': title_path,
+            'sections': summary_sections,
+            'source_section_count': len(summary_sections),
+            'source_unit_count': len(report_units),
+            'generated_at': datetime.now(UTC).isoformat(),
+        }
+
+    def _extract_scope_keywords(self, sections: list[dict[str, Any]], scope_text: str) -> list[str]:
+        values: list[str] = []
+        for section in sections:
+            for key in ('title', 'section_kind'):
+                value = str(section.get(key) or '').strip()
+                if value and value not in {'chapter', 'unit', 'appendix', 'ignore'}:
+                    values.append(value)
+            values.extend(str(part).strip() for part in section.get('structural_path') or [] if str(part or '').strip())
+        for keyword in [
+            '大坝',
+            '水库',
+            '安全鉴定',
+            '现场检查',
+            '安全检测',
+            '监测',
+            '防洪',
+            '渗流',
+            '结构安全',
+            '抗震',
+            '金属结构',
+            '运行管理',
+            '基础资料',
+            '评价报告',
+        ]:
+            if keyword in scope_text:
+                values.append(keyword)
+        return self._dedupe_scope_keywords(values)[:24]
+
+    def _dedupe_scope_keywords(self, values: Any) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        keywords: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            keyword = self._normalize_text(str(value or ''))
+            if not keyword or keyword in seen:
+                continue
+            seen.add(keyword)
+            keywords.append(keyword)
+        return keywords
+
     def _materialize_report_graph(
         self,
         *,
         document_id: str,
+        scope_summary: dict[str, Any],
         sections: list[dict[str, Any]],
         report_units: list[dict[str, Any]],
         tables: list[dict[str, Any]],
@@ -713,10 +886,24 @@ class ReportPipelineService:
                 'document_id': document_id,
                 'node_type': 'report',
                 'label': document_id,
-                'text_content': document_id,
-                'properties': {'document_id': document_id},
+                'text_content': scope_summary.get('summary') or document_id,
+                'properties': {'document_id': document_id, 'scope_summary_uid': scope_summary.get('scope_summary_uid')},
             }
         )
+        scope_summary_uid = str(scope_summary.get('scope_summary_uid') or '').strip()
+        if scope_summary_uid and str(scope_summary.get('summary') or '').strip():
+            add_node(
+                {
+                    'node_uid': scope_summary_uid,
+                    'document_id': document_id,
+                    'node_type': 'report_scope_summary',
+                    'label': 'scope_summary',
+                    'text_content': scope_summary.get('summary') or '',
+                    'properties': scope_summary,
+                },
+                embedding_text=scope_summary.get('summary') or '',
+            )
+            add_edge('SUMMARIZES', scope_summary_uid, report_uid)
 
         for section in sections:
             text_content = '\n'.join(
@@ -791,6 +978,71 @@ class ReportPipelineService:
                 add_edge('NEXT', left, right)
 
         return report_nodes, report_edges, embedding_documents
+
+    def _generate_embeddings(self, embedding_documents: list[dict[str, Any]], metrics: dict[str, Any]) -> dict[str, list[float]]:
+        if not embedding_documents:
+            metrics['embedding_generation_status'] = 'skipped_no_documents'
+            return {}
+        if not self.config.embedding.enabled:
+            metrics['embedding_generation_status'] = 'disabled'
+            return {}
+        if not self.embedding_client.enabled:
+            metrics['embedding_generation_status'] = f'missing_api_key:{self.config.embedding.api_key_env}'
+            return {}
+        embeddings: dict[str, list[float]] = {}
+        batch_size = max(1, self.config.embedding.batch_size)
+        batches = [embedding_documents[index : index + batch_size] for index in range(0, len(embedding_documents), batch_size)]
+        metrics['embedding_batch_count'] = len(batches)
+        if hasattr(self.embedding_client, 'reset_stats'):
+            self.embedding_client.reset_stats()
+        try:
+            for batch in batches:
+                vectors = self.embedding_client.embed_texts([item['text'] for item in batch])
+                for item, vector in zip(batch, vectors):
+                    embeddings[item['node_uid']] = vector
+        except Exception as exc:
+            logger.exception('Report embedding generation failed')
+            if hasattr(self.embedding_client, 'snapshot_stats'):
+                stats = self.embedding_client.snapshot_stats()
+                metrics['embedding_request_attempt_count'] = stats.get('request_attempt_count', 0)
+                metrics['embedding_retry_attempt_count'] = stats.get('retry_attempt_count', 0)
+                metrics['embedding_retried_batch_count'] = stats.get('retried_call_count', 0)
+            metrics['embedding_generation_status'] = f'failed:{exc}'
+            return {}
+        if hasattr(self.embedding_client, 'snapshot_stats'):
+            stats = self.embedding_client.snapshot_stats()
+            metrics['embedding_request_attempt_count'] = stats.get('request_attempt_count', 0)
+            metrics['embedding_retry_attempt_count'] = stats.get('retry_attempt_count', 0)
+            metrics['embedding_retried_batch_count'] = stats.get('retried_call_count', 0)
+        metrics['embedding_generation_status'] = 'completed'
+        metrics['embedding_vector_count'] = len(embeddings)
+        return embeddings
+
+    def _build_local_embedding_store_records(
+        self,
+        embedding_documents: list[dict[str, Any]],
+        embedding_vectors: dict[str, list[float]],
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for item in embedding_documents:
+            node_uid = item.get('node_uid')
+            if not node_uid:
+                continue
+            vector = embedding_vectors.get(node_uid)
+            if vector is None:
+                continue
+            records.append(
+                {
+                    'node_uid': node_uid,
+                    'document_id': item.get('document_id'),
+                    'node_type': item.get('node_type'),
+                    'text': item.get('text'),
+                    'embedding_model': self.config.embedding.model,
+                    'embedding_dimensions': len(vector),
+                    'embedding': vector,
+                }
+            )
+        return records
 
     def _detect_page_roles(self, blocks: list[dict[str, Any]]) -> dict[int, str]:
         blocks_by_page: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -1106,7 +1358,7 @@ class ReportPipelineService:
             'table_html': html,
             'table_footnote': footnote or None,
             'image_path': image_path,
-            'text': html or '',
+            'text': '\n'.join(part for part in [caption, text_body or html, footnote] if part).strip(),
         }
 
     def _image_to_payload(self, content: dict[str, Any]) -> dict[str, Any] | None:
@@ -1129,7 +1381,7 @@ class ReportPipelineService:
         }
 
     def _join_text_fragments(self, fragments: list[dict[str, Any]]) -> str:
-        return ''.join(fragment.get('content', '') for fragment in fragments if fragment.get('type') == 'text').strip()
+        return self._join_rich_fragments(fragments)
 
     def _join_rich_fragments(self, fragments: Any, *, separator: str = '') -> str:
         if isinstance(fragments, dict):
@@ -1140,6 +1392,9 @@ class ReportPipelineService:
                 return self._wrap_display_math(fragments.get('math_content') or fragments.get('content'))
             if fragments.get('math_content'):
                 return self._wrap_display_math(fragments.get('math_content'))
+            for key in ('text', 'latex'):
+                if fragments.get(key):
+                    return str(fragments.get(key) or '').strip()
             return self._join_rich_fragments(fragments.get('content'), separator=separator)
         if isinstance(fragments, list):
             parts = [self._join_rich_fragments(item, separator='') for item in fragments]
@@ -1184,6 +1439,7 @@ class ReportPipelineService:
         artifact_dir: Path,
         document_id: str,
         metrics: dict[str, Any],
+        scope_summary: dict[str, Any],
         sections: list[dict[str, Any]],
         report_units: list[dict[str, Any]],
         tables: list[dict[str, Any]],
@@ -1204,6 +1460,12 @@ class ReportPipelineService:
             f'- Report nodes: {metrics.get("report_node_count", 0)}',
             f'- Report edges: {metrics.get("report_edge_count", 0)}',
             f'- Embedding inputs: {metrics.get("embedding_document_count", 0)}',
+            f'- Embedding status: {metrics.get("embedding_generation_status", "n/a")}',
+            f'- Scope summary status: {metrics.get("scope_summary_status", "n/a")}',
+            '',
+            '## Scope Summary',
+            '',
+            scope_summary.get('summary') or 'n/a',
             '',
             '## Title Planning',
             '',

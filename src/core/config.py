@@ -114,6 +114,12 @@ class KnowledgeGraphConfig(BaseModel):
     materialize_graph: bool = True
 
 
+class RetrievalConfig(BaseModel):
+    global_top_k: int = 10
+    chapter_top_k: int = 20
+    graph_expansion_max_nodes: int = 20
+
+
 class AppConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
@@ -123,6 +129,7 @@ class AppConfig(BaseModel):
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     postgres: PostgresConfig = Field(default_factory=PostgresConfig)
     knowledge_graph: KnowledgeGraphConfig = Field(default_factory=KnowledgeGraphConfig)
+    retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     mineru_api_key: str | None = None
     root_dir: Path = ROOT_DIR
 

@@ -39,7 +39,7 @@ from repositories.standard_registry import StandardRegistry
 from services.normalization import NormalizationService
 from services.report_comparison_agent import ReportComparisonAgentService
 from services.report_pipeline import ReportPipelineService
-from services.retrieval_qa_service import RetrievalQAService
+from services.multi_space_retrieval_service import MultiSpaceRetrievalService
 from services.standard_pipeline import StandardPipelineService
 
 
@@ -75,7 +75,7 @@ class IngestionService:
         self.standard_pipeline_service = standard_pipeline_service
         self.report_pipeline_service = report_pipeline_service
         self.report_comparison_agent = ReportComparisonAgentService(config, ResponsesAPIClient(config))
-        self.retrieval_qa_service = RetrievalQAService(config)
+        self.retrieval_qa_service = MultiSpaceRetrievalService(config)
 
     def create_job(self, request: CreateIngestionJobRequest, background_tasks: BackgroundTasks) -> IngestionJob:
         source_path = self._resolve_source_path(request.sourcePath)
@@ -908,6 +908,9 @@ class IngestionService:
                 "materializeGraph": self.config.knowledge_graph.materialize_graph,
                 "postgresEnabled": self.config.postgres.enabled,
                 "graphSpaceCount": len(self.list_kg_spaces()),
+                "retrievalGlobalTopK": self.config.retrieval.global_top_k,
+                "retrievalChapterTopK": self.config.retrieval.chapter_top_k,
+                "retrievalGraphExpansionMaxNodes": self.config.retrieval.graph_expansion_max_nodes,
             },
             "graphLimits": {
                 "defaultDepth": GRAPH_WORKBENCH_DEFAULT_DEPTH,

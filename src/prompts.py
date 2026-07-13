@@ -110,6 +110,30 @@ LLM_REPORT_SECTION_SUMMARY_SYSTEM_PROMPT = """你是水利水电工程安全评�
 8. 输出必须严格满足给定 JSON Schema。"""
 
 
+LLM_REPORT_SCOPE_SUMMARY_SYSTEM_PROMPT = """你是水利水电工程安全评价报告的全文范围摘要生成器。输入是 report pipeline 已切分出的章节摘要、章节标题和少量结构信息。
+
+任务：
+1. 为整份报告生成一个中文 scope_summary，用于后续在多个规范 KG space 中选择最相关的规范空间。
+2. 摘要应覆盖报告的工程对象、评价/检查主题、关键安全专业方向、主要资料类型、结论或问题类型。
+3. 优先综合各 section 的 summary_overall；如果某些章节缺少摘要，可以参考标题、路径和成员数量，但不能补写输入中不存在的工程事实。
+4. 不要逐章罗列，不要输出 Markdown、编号列表或额外解释。
+5. scope_summary 建议控制在 180 到 350 字之间。
+6. keywords 提取 8 到 24 个中文关键词，用于粗粒度检索和路由。
+7. 输出必须严格满足给定 JSON Schema。"""
+
+
+LLM_KG_SPACE_PROFILE_SYSTEM_PROMPT = """你是水利水电规范 KG space 的范围画像生成器。输入是某个规范图谱中各 chapter 的标题与摘要。
+
+任务：
+1. 为该 KG space 生成一个中文 scope_summary，用于多规范检索时判断用户问题是否应进入该规范空间。
+2. 摘要应概括该规范覆盖的工程对象、专业主题、主要约束、检查/评价重点和适用范围。
+3. 只能依据输入的 chapter 标题和摘要总结，不能补写外部知识、未出现的条文、数值或适用范围。
+4. 不要逐章罗列，不要输出 Markdown、编号列表或额外解释。
+5. scope_summary 建议控制在 180 到 350 字之间。
+6. keywords 提取 8 到 24 个中文关键词，用于粗粒度检索和路由。
+7. 输出必须严格满足给定 JSON Schema。"""
+
+
 RAG_SCOPE_ROUTING_SYSTEM_PROMPT = """你是水利水电规范知识图谱问答的检索路由器。你的任务是根据用户问题，在给定的 chapter summary 与 section label 中选择最可能相关的范围，用于后续 clause / requirement 向量召回。
 
 要求：
@@ -122,11 +146,11 @@ RAG_SCOPE_ROUTING_SYSTEM_PROMPT = """你是水利水电规范知识图谱问答�
 RAG_ANSWER_SYSTEM_PROMPT = """你是水利水电规范知识图谱问答助手。你只能依据输入的检索上下文回答问题。
 
 要求：
-1. 只能使用检索上下文中的章节路径、条文号、clause 原文、requirement_text、judgement_criteria、evidence_expected 作答。
+1. 只能使用检索上下文中的 standard_uid、章节路径、条文号、clause 原文、requirement_text、judgement_criteria、evidence_expected 和 graph_expansion 作答。
 2. 不得编造上下文中不存在的事实、数值、条文或外部规范。
 3. 如果问题包含多个并列子问、多个条件或多个条文要求，必须逐项完整回答，不能只答第一部分。
 4. 如果检索上下文已包含对应条文，就直接给出答案，不要因为答案较长或包含多个相关要求而说“上下文不足”。
-5. 回答应使用中文，优先按条文/要求组织，保持简洁。
+5. 如果上下文来自多个 standard_uid，应按规范来源分组或明确标注来源，不能混淆不同规范的条款。
 6. 引用优先使用 clause_ref；如需要更细粒度引用，系统会在响应层补充 node_uid。"""
 
 
@@ -341,6 +365,60 @@ def build_report_section_summary_prompt(
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def build_report_scope_summary_prompt(
+    document_id: str,
+    sections: Sequence[dict[str, Any]],
+    report_units: Sequence[dict[str, Any]],
+) -> str:
+    payload = {
+        "document_id": document_id,
+        "task": "根据整份报告的章节摘要生成全文 scope_summary，用于跨 KG spaces 的第一层路由。",
+        "output_usage": "scope_summary 会被 embedding，并用于判断报告应与哪些规范图谱空间进行比对或检索。",
+        "report_stats": {
+            "section_count": len(sections),
+            "report_unit_count": len(report_units),
+        },
+        "sections": [
+            {
+                "section_uid": section.get("section_uid"),
+                "title": section.get("title"),
+                "section_kind": section.get("section_kind"),
+                "path": section.get("path") or [],
+                "structural_path": section.get("structural_path") or [],
+                "page_span": section.get("page_span") or [],
+                "member_count": section.get("member_count", 0),
+                "summary_overall": section.get("summary_overall") or "",
+                "summary": section.get("summary") or "",
+                "content_preview": section.get("content_preview") or "",
+            }
+            for section in sections
+            if section.get("section_kind") != "toc"
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def build_kg_space_profile_prompt(
+    standard_uid: str,
+    chapters: Sequence[dict[str, Any]],
+) -> str:
+    payload = {
+        "standard_uid": standard_uid,
+        "task": "根据规范各 chapter 摘要生成 KG space 的范围画像，用于跨 KG spaces 的第一层路由。",
+        "output_usage": "scope_summary 会被 embedding，并用于判断用户问题是否应进入该规范图谱空间。",
+        "chapters": [
+            {
+                "node_uid": chapter.get("node_uid"),
+                "ref": chapter.get("ref"),
+                "title": chapter.get("title") or chapter.get("label"),
+                "summary": chapter.get("summary") or "",
+            }
+            for chapter in chapters
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def build_rag_scope_routing_prompt(
     question: str,
     standard_uid: str,
@@ -406,12 +484,19 @@ def build_rag_answer_prompt(
         ],
         "retrieval_contexts": [
             {
+                "standard_uid": item.get("standard_uid"),
+                "node_uid": item.get("node_uid"),
+                "node_type": item.get("node_type"),
+                "score": item.get("score"),
+                "final_score": item.get("final_score"),
                 "chapter_path": item.get("chapter_path") or [],
+                "clause_uid": item.get("clause_uid"),
                 "clause_ref": item.get("clause_ref"),
                 "clause_text": item.get("clause_text"),
                 "requirement_text": item.get("requirement_text"),
                 "judgement_criteria": item.get("judgement_criteria") or [],
                 "evidence_expected": item.get("evidence_expected") or [],
+                "graph_expansion": item.get("graph_expansion") or [],
             }
             for item in retrieval_contexts
         ],
