@@ -149,7 +149,7 @@ class GraphMaterializationService:
 
         for clause_uid, items in requirement_groups.items():
             clause = clause_map.get(clause_uid)
-            clause_concepts = clause.get("concepts", []) if clause else []
+            clause_tags = clause.get("domain_tags", []) if clause else []
             for requirement in items:
                 add_node(
                     {
@@ -163,7 +163,7 @@ class GraphMaterializationService:
                 )
                 add_edge("DERIVES_REQUIREMENT", requirement["parent_clause_uid"], requirement["requirement_uid"])
 
-                for concept in self._dedupe_strings([*clause_concepts, *requirement.get("domain_tags", [])]):
+                for concept in self._dedupe_strings([*clause_tags, *requirement.get("domain_tags", [])]):
                     concept_uid = self._concept_uid(concept)
                     add_node(
                         {

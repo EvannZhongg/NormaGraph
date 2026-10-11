@@ -453,7 +453,7 @@ export function ReportPage() {
     }
     try {
       const detail = await getReportComparison(documentId, standardId)
-      setComparisonDetail(detail)
+      setComparisonDetail(normalizeComparisonDetail(detail))
     } catch (error) {
       if (isNotFoundError(error)) {
         setComparisonDetail(null)
@@ -477,7 +477,7 @@ export function ReportPage() {
     setStartingComparison(true)
     try {
       const detail = await startReportComparison(selectedReportId, selectedKgSpaceId)
-      setComparisonDetail(detail)
+      setComparisonDetail(normalizeComparisonDetail(detail))
       toast.success('已启动评估')
     } catch (error) {
       toast.error(extractErrorMessage(error, '报告评估启动失败'))
@@ -994,6 +994,59 @@ function buildComparisonGraphKey(comparisonDetail: ReportComparisonDetail | null
   return `${comparisonDetail.status}:${clauseKey}:${unitKey}`
 }
 
+function normalizeComparisonDetail(detail: ReportComparisonDetail): ReportComparisonDetail {
+  if (detail.clauseSummaries.length > 0) {
+    return detail
+  }
+
+  const summaries = new Map<string, ReportClauseSummary>()
+  const itemRows = detail.unitResults.length > 0
+    ? detail.unitResults.flatMap((result) => result.items.map((item) => ({ item, reportUnitId: result.reportUnitId })))
+    : detail.items.map((item) => ({ item, reportUnitId: '' }))
+  itemRows.forEach(({ item, reportUnitId }) => {
+    const clauseId = String(item.clauseId || '').trim()
+    if (!clauseId || !COMPARISON_STATUSES.includes(item.status)) {
+      return
+    }
+    const summary = summaries.get(clauseId) ?? {
+      clauseId,
+      clauseRef: item.clauseRef ?? null,
+      sectionId: item.sectionId ?? null,
+      chapterId: item.chapterId ?? null,
+      label: item.label || clauseId,
+      finalStatus: 'covered',
+      coveredCount: 0,
+      violatedCount: 0,
+      hitCount: 0,
+      evidenceUnits: [],
+    }
+    summary.finalStatus = item.status === 'violated' ? 'violated' : summary.finalStatus
+    if (item.status === 'covered') {
+      summary.coveredCount += 1
+    } else {
+      summary.violatedCount += 1
+    }
+    summary.hitCount += 1
+    summary.evidenceUnits.push({
+      reportUnitId,
+      status: item.status,
+      reason: item.reason || '',
+      reportEvidence: item.reportEvidence ?? null,
+    })
+    summaries.set(clauseId, summary)
+  })
+  if (summaries.size === 0) {
+    return detail
+  }
+  const clauseSummaries = [...summaries.values()]
+  const covered = clauseSummaries.filter((item) => item.finalStatus === 'covered').length
+  return {
+    ...detail,
+    clauseSummaries,
+    coverageScore: detail.coverageScore || (covered / clauseSummaries.length),
+  }
+}
+
 function buildFullReportComparisonGraph(
   standardId: string,
   kgNodes: GraphNodeData[],
@@ -1004,7 +1057,16 @@ function buildFullReportComparisonGraph(
   const displayKgNodes = kgNodes.filter((node) => isReportComparisonDisplayNode(node))
   const kgNodeIds = new Set(displayKgNodes.map((node) => String(node.node_uid || '')).filter(Boolean))
   const reportUnitById = new Map(reportUnits.map((unit, index) => [unit.unitUid, { unit, index }]))
-  const clauseSummaryById = new Map((comparisonDetail?.clauseSummaries ?? []).map((summary) => [summary.clauseId, summary]))
+  const clauseSummaryById = new Map<string, ReportClauseSummary>()
+  ;(comparisonDetail?.clauseSummaries ?? []).forEach((summary) => {
+    const aliases = [summary.clauseId, summary.clauseRef, summary.label]
+    aliases.forEach((alias) => {
+      const key = comparisonSummaryKey(alias)
+      if (key) {
+        clauseSummaryById.set(key, summary)
+      }
+    })
+  })
   const degreeMap = new Map<string, number>()
   const displayKgEdges = kgEdges.filter((edge) => {
     const source = String(edge.source_uid || '')
@@ -1021,7 +1083,10 @@ function buildFullReportComparisonGraph(
   const maxHitCount = Math.max(1, ...[...clauseSummaryById.values()].map((item) => item.hitCount))
   const nodes = displayKgNodes.map((node) => {
     const nodeId = String(node.node_uid || '')
-    const clauseSummary = clauseSummaryById.get(nodeId)
+    const clauseSummary = clauseSummaryById.get(comparisonSummaryKey(nodeId))
+      ?? clauseSummaryById.get(comparisonSummaryKey(node.properties?.clause_uid))
+      ?? clauseSummaryById.get(comparisonSummaryKey(node.properties?.clause_ref))
+      ?? clauseSummaryById.get(comparisonSummaryKey(node.label))
     const reportUnitsForClause = clauseSummary
       ? clauseSummary.evidenceUnits.map((unit) => {
           const unitRecord = reportUnitById.get(unit.reportUnitId)
@@ -1086,6 +1151,10 @@ function buildFullReportComparisonGraph(
     nodes,
     edges,
   }
+}
+
+function comparisonSummaryKey(value: unknown) {
+  return String(value ?? '').trim().toLowerCase()
 }
 
 function isReportComparisonDisplayNode(node: GraphNodeData) {

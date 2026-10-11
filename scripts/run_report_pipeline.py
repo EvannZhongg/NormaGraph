@@ -67,9 +67,11 @@ def main() -> None:
     print('report_units', len(output.report_units))
     print('tables', len(output.tables))
     print('figures', len(output.figures))
+    print('scope_summary_status', output.metrics.get('scope_summary_status'))
     print('report_nodes', len(output.report_nodes))
     print('report_edges', len(output.report_edges))
     print('embedding_documents', len(output.embedding_documents))
+    print('embedding_generation_status', output.metrics.get('embedding_generation_status'))
     print('section_kind_counts', output.metrics.get('section_kind_counts'))
     for key, path in files.items():
         print(key, path)

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DomainTaggingBatch",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "clause_uid": {"type": "string"},
+          "domain_tags": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^(过程|工程对象|环境|材料)-[^-]+(?:-[^-]+)*$"
+            }
+          }
+        },
+        "required": ["clause_uid", "domain_tags"]
+      }
+    }
+  },
+  "required": ["items"]
+}

@@ -1,6 +1,6 @@
 server:
   host: "127.0.0.1"
-  port: 8010
+  port: 8012
   reload: false
 
 storage:
@@ -39,6 +39,11 @@ knowledge_graph:
   fallback_to_heuristic_on_llm_error: true
   include_appendix_requirements: false
   materialize_graph: true
+
+retrieval:
+  global_top_k: 10
+  chapter_top_k: 20
+  graph_expansion_max_nodes: 20
 
 llm:
   enabled: true

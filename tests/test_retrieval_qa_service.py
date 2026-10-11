@@ -100,7 +100,9 @@ class RetrievalQAServiceTests(unittest.TestCase):
             self.assertIn("usage", payload)
             self.assertIn("embedding", payload["usage"])
             self.assertNotIn("rank", json.dumps(payload["retrieval"]["contexts"], ensure_ascii=False))
-            self.assertNotIn("score", json.dumps(payload["retrieval"]["contexts"], ensure_ascii=False))
+            self.assertTrue(payload["retrieval"]["contexts"])
+            self.assertIn("score", payload["retrieval"]["contexts"][0])
+            self.assertIsInstance(payload["retrieval"]["contexts"][0]["score"], float)
 
     def test_filter_selected_nodes_accepts_string_items(self) -> None:
         selected = RetrievalQAService._filter_selected_nodes(

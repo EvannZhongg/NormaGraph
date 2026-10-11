@@ -59,7 +59,7 @@ def build_xml_system_prompt() -> str:
 必须满足：
 1. 根节点是 <batch>。
 2. 每个条文输出一个 <item>。
-3. 每个 <item> 必须有 <clause_uid>、<clause_ref>、<concepts>、<requirements>。
+3. 每个 <item> 必须有 <clause_uid>、<clause_ref>、<requirements>；领域标签由独立 API 步骤生成。
 4. 如果没有规范性要求，仍然要输出该 item，并让 <requirements /> 为空。
 5. requirement 节点内允许包含：
    <requirement_text> <modality> <subject> <action_list> <object_list> <applicability_rule>

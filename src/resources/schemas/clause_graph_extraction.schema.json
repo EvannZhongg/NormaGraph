@@ -22,12 +22,6 @@
               "null"
             ]
           },
-          "concepts": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
           "requirements": {
             "type": "array",
             "items": {
@@ -83,12 +77,6 @@
                     "type": "string"
                   }
                 },
-                "domain_tags": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                },
                 "cited_targets": {
                   "type": "array",
                   "items": {
@@ -128,7 +116,6 @@
                 "object",
                 "judgement_criteria",
                 "evidence_expected",
-                "domain_tags",
                 "cited_targets"
               ]
             }
@@ -137,7 +124,6 @@
         "required": [
           "clause_uid",
           "clause_ref",
-          "concepts",
           "requirements"
         ]
       }

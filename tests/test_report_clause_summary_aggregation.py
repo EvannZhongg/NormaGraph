@@ -14,6 +14,28 @@ from services.ingestion_service import IngestionService
 
 
 class ReportClauseSummaryAggregationTest(unittest.TestCase):
+    def test_backfills_clause_summaries_for_legacy_comparison_payload(self) -> None:
+        service = IngestionService.__new__(IngestionService)
+        payload = service._backfill_report_comparison_summary(
+            {
+                "items": [],
+                "unitResults": [
+                    {
+                        "reportUnitId": "unit-1",
+                        "items": [
+                            {"clauseId": "clause-1", "status": "covered", "reason": "evidence"},
+                            {"clauseId": "clause-1", "status": "violated", "reason": "conflict"},
+                        ],
+                    }
+                ],
+                "coverageScore": 0.0,
+            }
+        )
+
+        self.assertEqual(payload["clauseSummaries"][0]["finalStatus"], "violated")
+        self.assertEqual(payload["clauseSummaries"][0]["hitCount"], 2)
+        self.assertEqual(payload["coverageScore"], 0.0)
+
     def test_clause_summaries_are_unique_and_missing_is_global(self) -> None:
         service = IngestionService.__new__(IngestionService)
         aggregate = service._aggregate_report_comparison(

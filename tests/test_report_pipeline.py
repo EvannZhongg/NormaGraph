@@ -129,6 +129,8 @@ class ReportPipelineStructureTest(unittest.TestCase):
         combined_unit_text = '\n'.join(unit['text_normalized'] for unit in output.report_units)
         self.assertIn(r'\(H_0 = H\)', combined_unit_text)
         self.assertIn(r'\[Q = m \varepsilon B \sigma_{s} \sqrt{2g} \cdot H_{0}^{3/2}\]', combined_unit_text)
+        self.assertIn('表 2.1-1 工程特性表', combined_unit_text)
+        self.assertIn('<table><tr><td>项目</td><td>数值</td></tr></table>', combined_unit_text)
         self.assertEqual(output.metrics['title_plan_source'], 'llm')
         self.assertEqual(output.metrics['title_plan_llm_item_count'], 7)
         self.assertEqual(output.metrics['title_plan_heuristic_item_count'], 0)

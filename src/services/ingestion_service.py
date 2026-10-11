@@ -1724,7 +1724,69 @@ class IngestionService:
         if not path.exists():
             return None
         payload = self._read_json_file_with_retries(path)
+        payload = self._backfill_report_comparison_summary(payload)
         return ReportComparisonDetail.model_validate(payload).model_dump(mode="json")
+
+    def _backfill_report_comparison_summary(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Make pre-clause-summary comparison files readable by the current UI."""
+        if payload.get("clauseSummaries"):
+            return payload
+
+        unit_results = payload.get("unitResults") or []
+        raw_items = [
+            item
+            for result in unit_results
+            if isinstance(result, dict)
+            for item in (result.get("items") or result.get("matchedClauses") or [])
+        ] or list(payload.get("items") or [])
+        summaries: dict[str, dict[str, Any]] = {}
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            clause_id = str(raw_item.get("clauseId") or raw_item.get("clause_id") or "").strip()
+            status = str(raw_item.get("status") or "").strip().lower()
+            if not clause_id or status not in {"covered", "violated"}:
+                continue
+            summary = summaries.setdefault(
+                clause_id,
+                {
+                    "clauseId": clause_id,
+                    "clauseRef": raw_item.get("clauseRef") or raw_item.get("clause_ref"),
+                    "sectionId": raw_item.get("sectionId") or raw_item.get("section_id"),
+                    "chapterId": raw_item.get("chapterId") or raw_item.get("chapter_id"),
+                    "label": raw_item.get("label") or clause_id,
+                    "finalStatus": "covered",
+                    "coveredCount": 0,
+                    "violatedCount": 0,
+                    "hitCount": 0,
+                    "evidenceUnits": [],
+                },
+            )
+            if status == "violated":
+                summary["finalStatus"] = "violated"
+            summary[f"{status}Count"] += 1
+            summary["hitCount"] += 1
+            report_unit_id = str(raw_item.get("reportUnitId") or "").strip()
+            if not report_unit_id:
+                report_unit_id = str(raw_item.get("report_unit_id") or "").strip()
+            summary["evidenceUnits"].append(
+                {
+                    "reportUnitId": report_unit_id,
+                    "status": status,
+                    "reason": str(raw_item.get("reason") or ""),
+                    "reportEvidence": raw_item.get("reportEvidence") or raw_item.get("report_evidence"),
+                }
+            )
+
+        if not summaries:
+            return payload
+        next_payload = dict(payload)
+        next_payload["clauseSummaries"] = list(summaries.values())
+        if not next_payload.get("coverageScore"):
+            covered = sum(1 for item in summaries.values() if item["finalStatus"] == "covered")
+            total = len(summaries)
+            next_payload["coverageScore"] = round(covered / total, 4) if total else 0.0
+        return next_payload
 
     def _save_report_comparison(self, document_id: str, standard_id: str, payload: dict[str, Any]) -> None:
         path = self._report_comparison_path(document_id, standard_id)

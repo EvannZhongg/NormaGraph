@@ -15,6 +15,7 @@ from core.config import AppConfig, get_config
 from prompts import LLM_KG_SPACE_PROFILE_SYSTEM_PROMPT, build_kg_space_profile_prompt
 from repositories.postgres_graph_store import PostgresGraphStore
 from services.chapter_summary_service import ChapterSummaryService
+from services.domain_tagging import DomainTaggingService
 from services.graph_materialization import GraphMaterializationService
 from services.llm_extraction import LLMGraphExtractionService
 from services.standard_outline_planner import StandardOutlinePlannerService
@@ -93,11 +94,14 @@ class StandardPipelineService:
         graph_materialization_service: GraphMaterializationService | None = None,
         embedding_client: EmbeddingsAPIClient | None = None,
         postgres_graph_store: PostgresGraphStore | None = None,
+        domain_tagging_service: DomainTaggingService | None = None,
     ) -> None:
         self.config = config or get_config()
         llm_client = ResponsesAPIClient(self.config)
         self.llm_client = llm_client
         self.llm_extraction_service = llm_extraction_service or LLMGraphExtractionService(self.config, llm_client)
+        self._domain_tagging_explicit = domain_tagging_service is not None
+        self.domain_tagging_service = domain_tagging_service or DomainTaggingService(self.config, llm_client)
         self.chapter_summary_service = chapter_summary_service or ChapterSummaryService(self.config, llm_client)
         self.outline_planner = outline_planner or StandardOutlinePlannerService(self.config, llm_client)
         self.graph_materialization_service = graph_materialization_service or GraphMaterializationService(self.config)
@@ -130,6 +134,9 @@ class StandardPipelineService:
         if title_plan_warnings:
             metrics['title_plan_warnings'] = title_plan_warnings
         requirements, extraction_metrics, extraction_warnings = self._extract_requirements(clauses, standard_uid)
+        tag_metrics, tag_warnings = self._apply_domain_tags(clauses, requirements, standard_uid)
+        extraction_metrics.update(tag_metrics)
+        extraction_warnings.extend(tag_warnings)
         chapter_summary_metrics, chapter_summary_warnings = self._generate_chapter_summaries(structure_nodes, clauses, standard_uid)
         kg_space_profile = self._build_kg_space_profile(structure_nodes, standard_uid)
         extraction_warnings = [*title_plan_warnings, *structure_warnings, *extraction_warnings, *chapter_summary_warnings]
@@ -496,7 +503,7 @@ class StandardPipelineService:
             ]
             current_clause['table_count'] = len(current_clause.get('tables', []))
             current_clause['requirement_count'] = 0
-            current_clause['concepts'] = []
+            current_clause['domain_tags'] = []
             clauses.append(current_clause)
             current_clause = None
 
@@ -718,6 +725,46 @@ class StandardPipelineService:
             metrics['extraction_mode_effective'] = 'heuristic'
         return llm_requirements, metrics, warnings
 
+    def _apply_domain_tags(
+        self,
+        clauses: list[dict[str, Any]],
+        requirements: list[dict[str, Any]],
+        standard_uid: str,
+    ) -> tuple[dict[str, Any], list[str]]:
+        # Heuristic-only runs are intentionally offline unless a tagging service is injected.
+        # Production's default LLM extraction path always executes this independent API step.
+        if self.config.knowledge_graph.extraction_mode == 'heuristic' and not self._domain_tagging_explicit:
+            for clause in clauses:
+                clause['domain_tags'] = []
+            for requirement in requirements:
+                requirement['domain_tags'] = []
+            return {'domain_tag_requested_clause_count': 0, 'domain_tag_call_count': 0, 'domain_tagged_clause_count': 0}, []
+        eligible = [
+            clause for clause in clauses
+            if clause.get('body_kind') == 'main' or (
+                self.config.knowledge_graph.include_appendix_requirements and clause.get('body_kind') == 'appendix'
+            )
+        ]
+        requirement_groups: dict[str, list[dict[str, Any]]] = {}
+        for requirement in requirements:
+            requirement_groups.setdefault(requirement.get('parent_clause_uid'), []).append(requirement)
+        tagging_input = []
+        for clause in eligible:
+            enriched = dict(clause)
+            enriched['requirements'] = requirement_groups.get(clause.get('clause_uid'), [])
+            tagging_input.append(enriched)
+        result = self.domain_tagging_service.tag_clauses(standard_uid, tagging_input)
+        for clause in clauses:
+            tags = list(result.clause_tags.get(clause.get('clause_uid'), []))
+            clause['domain_tags'] = tags
+            for requirement in requirement_groups.get(clause.get('clause_uid'), []):
+                requirement['domain_tags'] = list(tags)
+        return {
+            'domain_tag_requested_clause_count': result.metrics.get('requested_clause_count', 0),
+            'domain_tag_call_count': result.metrics.get('tag_call_count', 0),
+            'domain_tagged_clause_count': result.metrics.get('tagged_clause_count', 0),
+        }, result.warnings
+
     def _generate_chapter_summaries(
         self,
         structure_nodes: list[dict[str, Any]],
@@ -749,7 +796,6 @@ class StandardPipelineService:
         return requirements
 
     def _requirements_from_llm(self, clause: dict[str, Any], item: dict[str, Any], standard_uid: str) -> list[dict[str, Any]]:
-        clause['concepts'] = self._dedupe_strings([*(item.get('concepts') or []), *self._domain_tags(clause)])
         if item.get('clause_summary'):
             clause['clause_summary'] = item['clause_summary']
         extracted_requirements = item.get('requirements') or []
@@ -786,7 +832,7 @@ class StandardPipelineService:
                     'applicability_rule': candidate.get('applicability_rule') or self._extract_applicability(requirement_text),
                     'judgement_criteria': self._dedupe_strings(candidate.get('judgement_criteria') or [f'应在报告或资料中体现：{requirement_text}']),
                     'evidence_expected': self._dedupe_strings(candidate.get('evidence_expected') or self._infer_evidence(requirement_text)),
-                    'domain_tags': self._dedupe_strings([*(candidate.get('domain_tags') or []), *clause.get('concepts', [])]),
+                    'domain_tags': [],
                     'cited_targets': cited_targets,
                     'confidence': round(min(clause['segmentation_confidence'], llm_confidence), 2),
                 }
@@ -867,7 +913,6 @@ class StandardPipelineService:
                         modality_override=inherited_modality,
                     )
                 )
-            clause['concepts'] = self._domain_tags(clause)
             return candidates
         for segment in self._split_clause_text(text):
             modality = self._detect_modality(segment)
@@ -886,7 +931,6 @@ class StandardPipelineService:
                     modality_override=modality,
                 )
             )
-        clause['concepts'] = self._domain_tags(clause)
         return candidates
 
     def _build_requirement(
@@ -925,7 +969,7 @@ class StandardPipelineService:
             'applicability_rule': self._extract_applicability(requirement_text),
             'judgement_criteria': [f'应在报告或资料中体现：{requirement_text}'],
             'evidence_expected': self._infer_evidence(requirement_text),
-            'domain_tags': self._domain_tags(clause),
+            'domain_tags': [],
             'cited_targets': self._extract_cited_targets(requirement_text),
             'confidence': round(min(clause['segmentation_confidence'], split_confidence), 2),
         }
@@ -1582,13 +1626,6 @@ class StandardPipelineService:
             evidence.append('相关说明资料')
         return list(dict.fromkeys(evidence))
 
-    def _domain_tags(self, clause: dict[str, Any]) -> list[str]:
-        tags = list(clause.get('heading_path', []))
-        for keyword in ['现场安全检查', '安全检测', '监测', '运行管理', '防洪能力', '渗流安全', '结构安全', '抗震安全', '金属结构']:
-            if keyword in clause['source_text_normalized']:
-                tags.append(keyword)
-        return list(dict.fromkeys(tags))
-
     def _extract_cited_targets(self, text: str) -> list[dict[str, str | None]]:
         targets = []
         for match in STANDARD_REF_RE.finditer(text):
@@ -1739,7 +1776,7 @@ class StandardPipelineService:
                 f'- Pages: {page_text}',
                 f'- Segmentation confidence: {clause["segmentation_confidence"]}',
                 f'- Requirement count: {clause.get("requirement_count", 0)}',
-                f'- Concepts: {", ".join(clause.get("concepts", [])) or "n/a"}',
+                f'- Domain tags: {", ".join(clause.get("domain_tags", [])) or "n/a"}',
                 '- Text:',
                 '',
                 clause.get('source_text_normalized') or clause.get('source_text') or '',

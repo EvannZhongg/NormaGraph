@@ -407,7 +407,6 @@ class LLMGraphExtractionService:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            concepts = self._coerce_string_list(item.get("concepts") or item.get("domain_tags"))
             requirements_value = item.get("requirements") or item.get("items") or []
             if isinstance(requirements_value, dict):
                 requirements_value = [requirements_value]
@@ -418,7 +417,6 @@ class LLMGraphExtractionService:
                     "clause_uid": self._coerce_string(item.get("clause_uid")),
                     "clause_ref": self._coerce_string(item.get("clause_ref")),
                     "clause_summary": self._coerce_optional_string(item.get("clause_summary") or item.get("summary")),
-                    "concepts": concepts,
                     "requirements": [
                         self._normalize_requirement_item(candidate)
                         for candidate in requirements_value
@@ -463,7 +461,6 @@ class LLMGraphExtractionService:
             "applicability_rule": self._coerce_optional_string(item.get("applicability_rule")),
             "judgement_criteria": self._coerce_string_list(item.get("judgement_criteria")),
             "evidence_expected": self._coerce_string_list(item.get("evidence_expected")),
-            "domain_tags": self._coerce_string_list(item.get("domain_tags") or item.get("concepts")),
             "cited_targets": normalized_targets,
             "confidence": item.get("confidence"),
         }
